@@ -2976,6 +2976,8 @@ namespace Legion {
         Domain parent_dom = forest->get_index_space_domain(parent);
         size_t parent_elmts = 
           parent_dom.get_index_space().get_valid_mask().get_num_elmts();
+        const int parent_first_element =
+          parent_dom.get_index_space().get_valid_mask().get_first_element();
         for (Domain::DomainPointIterator itr(parent_dom); itr; itr++)
         {
           ptr_t cur_ptr = itr.p.get_index();
@@ -2990,7 +2992,8 @@ namespace Legion {
             // Haven't made an index space for this color yet
             if (finder == child_masks.end())
             {
-              child_masks[color] = Realm::ElementMask(parent_elmts);
+              child_masks[color] = Realm::ElementMask(parent_elmts,
+                                                      parent_first_element);
               finder = child_masks.find(color);
             }
 #ifdef DEBUG_LEGION
@@ -4008,8 +4011,7 @@ namespace Legion {
           return launcher.predicate_false_future;
         // Otherwise check to see if we have a value
         FutureImpl *result = legion_new<FutureImpl>(runtime, true/*register*/,
-          runtime->get_available_distributed_id(true), 
-          runtime->address_space, runtime->address_space);
+          runtime->get_available_distributed_id(true), runtime->address_space);
         if (launcher.predicate_false_result.get_size() > 0)
           result->set_result(launcher.predicate_false_result.get_ptr(),
                              launcher.predicate_false_result.get_size(),
@@ -4074,7 +4076,9 @@ namespace Legion {
       // Quick out for predicate false
       if (launcher.predicate == Predicate::FALSE_PRED)
       {
-        FutureMapImpl *result = legion_new<FutureMapImpl>(this, runtime);
+        FutureMapImpl *result = legion_new<FutureMapImpl>(this, runtime,
+            runtime->get_available_distributed_id(true/*needs continuation*/),
+            runtime->address_space);
         if (launcher.predicate_false_future.impl != NULL)
         {
           ApEvent ready_event = 
@@ -4098,7 +4102,7 @@ namespace Legion {
             // Otherwise launch a task to complete the future map,
             // add the necessary references to prevent premature
             // garbage collection by the runtime
-            result->add_reference();
+            result->add_base_gc_ref(DEFERRED_TASK_REF);
             launcher.predicate_false_future.impl->add_base_gc_ref(
                                                 FUTURE_HANDLE_REF);
             Runtime::DeferredFutureMapSetArgs args;
@@ -4183,8 +4187,7 @@ namespace Legion {
           return launcher.predicate_false_future;
         // Otherwise check to see if we have a value
         FutureImpl *result = legion_new<FutureImpl>(runtime, true/*register*/, 
-          runtime->get_available_distributed_id(true), 
-          runtime->address_space, runtime->address_space);
+          runtime->get_available_distributed_id(true), runtime->address_space);
         if (launcher.predicate_false_result.get_size() > 0)
           result->set_result(launcher.predicate_false_result.get_ptr(),
                              launcher.predicate_false_result.get_size(),
@@ -5741,12 +5744,8 @@ namespace Legion {
                                           DynamicCollective dc, const Future &f) 
     //--------------------------------------------------------------------------
     {
-      // This is a little Realm specific, but can't avoid it at the moment
-      // 20 bits for the generation and everything else is ID
-      const unsigned long id = dc.phase_barrier.id & 0xFFFFFFFFFFF00000UL;
-      const unsigned gen = dc.phase_barrier.id & 0xFFFFF;
       AutoLock ctx(context_lock);
-      collective_contributions[id][gen].push_back(f);
+      collective_contributions[dc.phase_barrier].push_back(f);
     }
 
     //--------------------------------------------------------------------------
@@ -5757,30 +5756,13 @@ namespace Legion {
       // Find any future contributions and record dependences for the op
       // Contributions were made to the previous phase
       ApEvent previous = Runtime::get_previous_phase(dc.phase_barrier);
-      const unsigned long id = previous.id & 0xFFFFFFFFFFF00000UL;
-      const unsigned gen = previous.id & 0xFFFFF;
       AutoLock ctx(context_lock);
-      std::map<unsigned long, std::map<unsigned,
-        std::vector<Future> > >::iterator finder = 
-          collective_contributions.find(id);
+      std::map<ApEvent,std::vector<Future> >::iterator finder = 
+          collective_contributions.find(previous);
       if (finder == collective_contributions.end())
         return;
-      std::map<unsigned,std::vector<Future> >::iterator it = 
-        finder->second.begin();
-      while ((it != finder->second.end()) && (it->first <= gen))
-      {
-        if (it->first == gen)
-        {
-          contributions = it->second;
-          it++;
-        }
-        else
-        {
-          std::map<unsigned,std::vector<Future> >::iterator to_erase = it;
-          it++;
-          finder->second.erase(to_erase);
-        }
-      }
+      contributions = finder->second;
+      collective_contributions.erase(finder);
     }
 
     //--------------------------------------------------------------------------
@@ -6184,13 +6166,6 @@ namespace Legion {
     void InnerContext::end_task(const void *res, size_t res_size, bool owned)
     //--------------------------------------------------------------------------
     {
-#ifdef DEBUG_LEGION
-      assert(owner_task != NULL);
-      runtime->decrement_total_outstanding_tasks(owner_task->task_id, 
-                                                 false/*meta*/);
-#else
-      runtime->decrement_total_outstanding_tasks();
-#endif
       if (overhead_tracker != NULL)
       {
         const long long current = Realm::Clock::current_time_in_nanoseconds();
@@ -6287,6 +6262,13 @@ namespace Legion {
           runtime->add_to_dependence_queue(this, executing_processor, close_op);
         }
       }
+      // Grab some information before doing the next step in case it
+      // results in the deletion of 'this'
+#ifdef DEBUG_LEGION
+      assert(owner_task != NULL);
+      const TaskID owner_task_id = owner_task->task_id;
+#endif
+      Runtime *runtime_ptr = runtime;
       // See if we want to move the rest of this computation onto
       // the utility processor. We also need to be sure that we have 
       // registered all of our operations before we can do the post end task
@@ -6311,6 +6293,12 @@ namespace Legion {
       }
       else
         post_end_task(res, res_size, owned);
+#ifdef DEBUG_LEGION
+      runtime_ptr->decrement_total_outstanding_tasks(owner_task_id, 
+                                                     false/*meta*/);
+#else
+      runtime_ptr->decrement_total_outstanding_tasks();
+#endif
     }
 
     //--------------------------------------------------------------------------
@@ -8507,19 +8495,19 @@ namespace Legion {
     void LeafContext::end_task(const void *res, size_t res_size, bool owned)
     //--------------------------------------------------------------------------
     {
-#ifdef DEBUG_LEGION
-      assert(owner_task != NULL);
-      runtime->decrement_total_outstanding_tasks(owner_task->task_id, 
-                                                 false/*meta*/);
-#else
-      runtime->decrement_total_outstanding_tasks();
-#endif
       if (overhead_tracker != NULL)
       {
         const long long current = Realm::Clock::current_time_in_nanoseconds();
         const long long diff = current - previous_profiling_time;
         overhead_tracker->application_time += diff;
       }
+      // Grab some information before doing the next step in case it
+      // results in the deletion of 'this'
+#ifdef DEBUG_LEGION
+      assert(owner_task != NULL);
+      const TaskID owner_task_id = owner_task->task_id;
+#endif
+      Runtime *runtime_ptr = runtime;
       if (runtime->has_explicit_utility_procs)
       {
         PostEndArgs post_end_args;
@@ -8540,6 +8528,12 @@ namespace Legion {
       }
       else
         post_end_task(res, res_size, owned);
+#ifdef DEBUG_LEGION
+      runtime_ptr->decrement_total_outstanding_tasks(owner_task_id, 
+                                                     false/*meta*/);
+#else
+      runtime_ptr->decrement_total_outstanding_tasks();
+#endif
     }
 
     //--------------------------------------------------------------------------

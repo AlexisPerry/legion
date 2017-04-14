@@ -345,16 +345,12 @@ function getMouseOver() {
     var p = d3.mouse(this);
     var x = parseFloat(p[0]);
     var y = timelineLevelCalculator(d) - 5;
-    var relativeX = (x - $("#timeline").scrollLeft())
-    var anchor = relativeX < left ? "start" :
-                 relativeX < right ? "middle" : "end";
     var descView = state.timelineSvg.append("g")
                         .attr("id", "desc");
     var text = descView.append("text")
                        .attr("x", x)
                        .attr("y", y)
                        .attr("class", "desc");
-
 
     if ((d.in.length != 0) || (d.out.length != 0)) {
       d3.select(this).style("cursor", "pointer")
@@ -375,15 +371,12 @@ function getMouseOver() {
     var title = text.append("tspan")
       .attr("x", x)
       .attr("dy", -12)
-      .attr("text-anchor", anchor)
       .attr("class", "desc")
       .text(descTexts[0].replace(/ /g, "\u00A0")); // preserve spacing
 
-    var titleX = title.node().getBBox().x;
-    
     for (var i = 1; i < descTexts.length; ++i) {
       var elem = text.append("tspan")
-        .attr("x", titleX)
+        .attr("x", x)
         .attr("dy", -12)
         .attr("class", "desc")
         .text(descTexts[i].replace(/ /g, "\u00A0")); // preserve spacing
@@ -398,6 +391,15 @@ function getMouseOver() {
         .attr("height", bbox.height + (padding*2))
         .style("fill", "#222")
         .style("opacity", "0.7");
+
+    var bboxRight = bbox.x + bbox.width;
+    var timelineRight = $("#timeline").scrollLeft() + $("#timeline").width();
+
+    // If the box moves off the screen, nudge it back
+    if (bboxRight > timelineRight) {
+      var translation = -(bboxRight - timelineRight + 20);
+      descView.attr("transform", "translate(" + translation + ",0)");
+    }
   };
 }
 
@@ -638,8 +640,11 @@ function drawTimeline() {
   updateURL(state.zoom, state.scale);
   var timelineGroup = state.timelineSvg.select("g#timeline");
   timelineGroup.selectAll("rect").remove();
+  timelineGroup.selectAll("text").remove();
   var timeline = timelineGroup.selectAll("rect")
     .data(state.dataToDraw, function(d) { return d.proc.base + "-" + d.id; });
+  var timelineText = timelineGroup.selectAll("text")
+    .data(state.memoryTexts);
   var mouseOver = getMouseOver();
 
   timeline.enter().append("rect");
@@ -685,6 +690,32 @@ function drawTimeline() {
       state.timelineSvg.selectAll("#desc").remove();
     })
     .on("mousedown", timelineEventMouseDown);
+
+
+  timelineText.enter().append("text");
+
+  timelineText
+    .attr("class", "timeline")
+    .attr("y", timelineTextLevelCalculator)
+    .attr("text-anchor", "start")
+    .text(function(d) { 
+       var sizeRegex = /Size=(.*)/;
+       var match = sizeRegex.exec(d.title);
+       return match[1];
+    })
+    .attr("visibility", function(d) {
+      var textWidth = this.getComputedTextLength();
+      var startX = convertToPos(state, d.start);
+      var endX = convertToPos(state, d.end);
+      var boxWidth = endX - startX;
+      return boxWidth > textWidth ? "visible" : "hidden";
+    })
+    .attr("x", function(d) { 
+      var textWidth = this.getComputedTextLength();
+      var midPoint = convertToPos(state, d.start + (d.end - d.start) / 2); 
+      midPoint -= textWidth / 2;
+      return midPoint
+    });
 
   drawUtil();
   timeline.on("mouseover", mouseOver);
@@ -856,6 +887,11 @@ function utilLevelCalculator(timelineElement) {
 function timelineLevelCalculator(timelineEvent) {  
   return constants.margin_top + 
          (timelineEvent.proc.base + timelineEvent.level) * state.thickness;
+};
+
+function timelineTextLevelCalculator(timelineEvent) {  
+  return constants.margin_top + 
+         (timelineEvent.proc.base + timelineEvent.level + 0.75) * state.thickness;
 };
 
 function dependencyLineLevelCalculator(level) {
