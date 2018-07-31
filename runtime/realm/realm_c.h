@@ -93,6 +93,11 @@ typedef
     size_t /*userlen*/,
     realm_id_t /*proc_id*/);
 
+// APERRY
+void* getRealmCTX();
+void realmSpawn(void func(void *), const void* args, size_t arglen, void* user_data, size_t user_data_len);
+void realmSync();
+
 #ifdef __cplusplus
 }
 #endif
