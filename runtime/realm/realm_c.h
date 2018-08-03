@@ -95,7 +95,8 @@ typedef
 
 // APERRY
 void* getRealmCTX();
-void realmSpawn(void func(void *), const void* args, size_t arglen, void* user_data, size_t user_data_len);
+void realmInitRuntime(int argc, char** argv);
+void realmSpawn(void (*func) (), const void* args, size_t arglen, void* user_data, size_t user_data_len);
 void realmSync();
 
 #ifdef __cplusplus
