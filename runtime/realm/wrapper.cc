@@ -2,15 +2,17 @@
 
 #include "realm.h"
 #include <set>
-#include <typeinfo>
-#include <typeindex>
+//#include <array>
+#include <vector>
+//#include <typeinfo>
+//#include <typeindex>
 
 extern "C" {
   
   struct context {
     Realm::Runtime rt;
     std::set<Realm::Event> events;
-    std::set<Realm::Event> mem_events;
+    //std::set<Realm::Event> mem_events;
     unsigned cur_task;
   };
 
@@ -49,6 +51,48 @@ extern "C" {
 
 
   //realmCreateRegion
+  void* realmCreateRegion_int(int* data) {
+
+    const Realm::ProfilingRequestSet prs;  //We don't care what it is for now, the default is fine
+
+    //get a processor to run on
+    Realm::Machine::ProcessorQuery procquery(Realm::Machine::get_machine());
+    Realm::Processor p = procquery.local_address_space().random();
+    assert ( p != Realm::Processor::NO_PROC); //assert that the processor exists
+
+    //get a memory associated with that processor to copy to
+    Realm::Machine::MemoryQuery memquery(Realm::Machine::get_machine());
+    Realm::Memory m = memquery.local_address_space().best_affinity_to(p).random();
+    assert ( m != Realm::Memory::NO_MEMORY); //assert that the memory exists
+
+    //create a physical region for the copy
+    Realm::RegionInstance R;
+
+    //create a point object out of the data being passed
+    const size_t length = sizeof(data)/sizeof(data[0]);
+    Realm::Point<length,int> pt = Realm::Point<length,int>(data);
+
+    //create an indexspace out of the point
+    std::vector<Realm::Point<length, int> > myPointVec;
+    myPointVec.push_back(pt);
+    const Realm::IndexSpace<length,int> is = Realm::IndexSpace<length,int>(myPointVec);
+
+    //create a vector of field sizes
+    std::vector<size_t> field_sizes = {sizeof(data[0])}; //data is an array of ints, so there is only one field
+
+    //constexpr auto user_data_type = std::type_index(DTYPE);
+    //constexpr auto user_data_type = (constexpr)DTYPE.name();
+    //Realm::InstanceLayout<user_data_len,typeid(user_data[0]).name()> il;
+    //Realm::InstanceLayout<1,user_data_type> il = Realm::InstanceLayoutOpaque(user_data_len,alignof(user_data)); //alignment is what?
+    //Realm::InstanceLayout<1,typeid(user_element).name()> il = Realm::InstanceLayoutOpaque(user_data_len,alignof(user_data)); //alignment is what?
+    //const Realm::InstanceLayoutGeneric * il = ((Realm::RegionInstance *)data_region)->get_layout(); //copy the layout of the source region
+
+    //Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, Realm::Event::NO_EVENT);
+    Realm::Event regEvt = Realm::RegionInstance::create_instance(R, m, is, field_sizes, 0, prs, Realm::Event::NO_EVENT); //the 0 denotes use SOA layout
+    //ctx->mem_events.insert(regEvt);
+
+    return (void*) &R;
+  }
 
   //only use this internally (or eliminate it all together and call destroy directly
   void realmDestroyRegion(void *region, void *event) {
@@ -63,7 +107,7 @@ extern "C" {
   //Note: borrowed this routine from https://github.com/StanfordLegion/legion/blob/stable/examples/realm_stencil/realm_stencil.cc
   Realm::Event realmCopy(Realm::RegionInstance src_inst, 
 			 Realm::RegionInstance dst_inst, 
-			 Realm::FieldID fid,
+			 Realm::FieldID fid, //int
 			 Realm::Event wait_for) {
     Realm::CopySrcDstField src_field;
     src_field.inst = src_inst;
@@ -142,8 +186,8 @@ extern "C" {
     //Realm::InstanceLayout<1,typeid(user_element).name()> il = Realm::InstanceLayoutOpaque(user_data_len,alignof(user_data)); //alignment is what?
     const Realm::InstanceLayoutGeneric * il = ((Realm::RegionInstance *)data_region)->get_layout(); //copy the layout of the source region
 
-    Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, Realm::Event::NO_EVENT);
-    ctx->events.insert(regEvt);
+    Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, ((Realm::RegionInstance *)data_region)->get_ready_event());
+    //ctx->mem_events.insert(regEvt);
     
     //copy the user data to the region
     while (!regEvt.has_triggered())
@@ -161,6 +205,8 @@ extern "C" {
     std::cout << "Spawned the task" << std::endl;
     ctx->events.insert(e2);
     std::cout << "Added the spawn event to the context's set of Events" << std::endl;
+
+    //copy the data back over
     return;
   }
   
