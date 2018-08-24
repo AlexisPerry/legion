@@ -20,13 +20,13 @@ extern "C" {
   static context *_globalCTX;  //global variable
   
   context * getRealmCTX() {
-    std::cout << "start of getRealmCTX" << std::endl;
+    //std::cout << "start of getRealmCTX" << std::endl;
     if ( _globalCTX) {
-      std::cout << "_globalCTX exists : returning it" << std::endl;
+      //std::cout << "_globalCTX exists : returning it" << std::endl;
       return _globalCTX;
     }
     else {
-      std::cout << "_globalCTX does not exist: returning a null pointer" << std::endl;
+      //std::cout << "_globalCTX does not exist: returning a null pointer" << std::endl;
       return NULL;
     }
   }
@@ -57,32 +57,38 @@ extern "C" {
     context * ctx = getRealmCTX();
 
     const Realm::ProfilingRequestSet prs;  //We don't care what it is for now, the default is fine
+    std::cout << "Created default prs" << std::endl;
 
     //get a processor to run on
     Realm::Machine::ProcessorQuery procquery(Realm::Machine::get_machine());
     Realm::Processor p = procquery.local_address_space().random();
     assert ( p != Realm::Processor::NO_PROC); //assert that the processor exists
+    std::cout << "Got a processor" << std::endl;
 
     //get a memory associated with that processor to copy to
     Realm::Machine::MemoryQuery memquery(Realm::Machine::get_machine());
     Realm::Memory m = memquery.local_address_space().best_affinity_to(p).random();
     assert ( m != Realm::Memory::NO_MEMORY); //assert that the memory exists
+    std::cout << "Got a memory" << std::endl;
 
     //create a physical region for the copy
-    Realm::RegionInstance R;
+    Realm::RegionInstance * R = new Realm::RegionInstance();
+    std::cout << "Created default RegionInstance" << std::endl;
 
     //create a point object out of the data being passed
     const size_t length = sizeof(data)/sizeof(data[0]);
     Realm::Point<length,int> pt = Realm::Point<length,int>(data);
+    std::cout << "Created Point" << std::endl;
 
     //create an indexspace out of the point
     std::vector<Realm::Point<length, int> > myPointVec;
     myPointVec.push_back(pt);
     const Realm::IndexSpace<length,int> is = Realm::IndexSpace<length,int>(myPointVec);
+    std::cout << "Created IndexSpace" << std::endl;
 
     //create a vector of field sizes
     std::vector<size_t> field_sizes = {sizeof(data[0])}; //data is an array of ints, so there is only one field
-
+    std::cout << "Created field_sizes" << std::endl;
     //constexpr auto user_data_type = std::type_index(DTYPE);
     //constexpr auto user_data_type = (constexpr)DTYPE.name();
     //Realm::InstanceLayout<user_data_len,typeid(user_data[0]).name()> il;
@@ -91,10 +97,12 @@ extern "C" {
     //const Realm::InstanceLayoutGeneric * il = ((Realm::RegionInstance *)data_region)->get_layout(); //copy the layout of the source region
 
     //Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, Realm::Event::NO_EVENT);
-    Realm::Event regEvt = Realm::RegionInstance::create_instance(R, m, is, field_sizes, 0, prs, Realm::Event::NO_EVENT); //the 0 denotes use SOA layout
+    Realm::Event regEvt = Realm::RegionInstance::create_instance(*R, m, is, field_sizes, 0, prs, Realm::Event::NO_EVENT); //the 0 denotes use SOA layout
+    std::cout << "Executed create_instance" << std::endl;
     ctx->mem_events.insert(regEvt);
+    std::cout << "Inserted creation instance into ctx->mem_events" << std::endl;
 
-    return (void*) &R;
+    return (void*) R;
   }
 
   void realmDestroyRegion(void *region) {
@@ -175,12 +183,13 @@ extern "C" {
   }
 
   //NOTE: this is for integers for now
-  void realmSpawn(void (*func)(void), 
+  //void realmSpawn(void (*func)(void), 
+  void realmSpawn(const char *lib_name, const char *symbol_name, 
 		  const void* args, 
 		  size_t arglen, 
 		  void* user_data, 
-		  size_t user_data_len, 
-		  void* data_region) {           
+		  size_t user_data_len){ 
+    //		  void* data_region) {           
     /* take a function pointer to the task you want to run, 
        creates a CodeDescriptor from it
        needs pointer to user data and arguments (NULL for void?)
@@ -203,8 +212,9 @@ extern "C" {
 
     Realm::CodeDescriptor cd = Realm::CodeDescriptor(Realm::TypeConv::from_cpp_type<Realm::Processor::TaskFuncPtr>());
     std::cout << "Created CodeDescriptor" << std::endl;
-    Realm::FunctionPointerImplementation fpi = Realm::FunctionPointerImplementation(func);
-    std::cout << "Created FunctionPointerImplementation" << std::endl;
+    //Realm::FunctionPointerImplementation fpi = Realm::FunctionPointerImplementation(func);
+    //std::cout << "Created FunctionPointerImplementation" << std::endl;
+    Realm::DSOReferenceImplementation fpi = Realm::DSOReferenceImplementation(std::string(lib_name), std::string(symbol_name));
     cd.add_implementation(&fpi);
     std::cout << "added the implementation to the CodeDescriptor" << std::endl;
     //cd.add_implementation(Realm::FunctionPointerImplementation(func).clone());
@@ -224,33 +234,33 @@ extern "C" {
 
     //create a physical region for the copy
     //predicate creation of this region on the creation and initialization of the old region
-    Realm::Event mem_event = mem_sync();
-    Realm::RegionInstance R;
+    //    Realm::Event mem_event = mem_sync();
+    //Realm::RegionInstance R;
 
     //constexpr auto user_data_type = std::type_index(DTYPE);
     //constexpr auto user_data_type = (constexpr)DTYPE.name();
     //Realm::InstanceLayout<user_data_len,typeid(user_data[0]).name()> il;
     //Realm::InstanceLayout<1,user_data_type> il = Realm::InstanceLayoutOpaque(user_data_len,alignof(user_data)); //alignment is what?
     //Realm::InstanceLayout<1,typeid(user_element).name()> il = Realm::InstanceLayoutOpaque(user_data_len,alignof(user_data)); //alignment is what?
-    const Realm::InstanceLayoutGeneric * il = ((Realm::RegionInstance *)data_region)->get_layout(); //copy the layout of the source region
+    //const Realm::InstanceLayoutGeneric * il = ((Realm::RegionInstance *)data_region)->get_layout(); //copy the layout of the source region
 
     //NOTE: the following is not implemented in realm, but only exists in a header file function declaration
     // If implemented, it would eliminate the need for ctx->mem_events.
     //Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, ((Realm::RegionInstance *)data_region)->get_ready_event());
 
-    Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, mem_event);
-    ctx->mem_events.insert(regEvt);
+    //Realm::Event regEvt = Realm::RegionInstance::create_instance(R,m,(Realm::InstanceLayoutGeneric *)il,prs, mem_event);
+    //ctx->mem_events.insert(regEvt);
     
     //copy the user data to the region
     //while (!regEvt.has_triggered())
     //continue;
     //R.write_untyped(0, user_data, user_data_len);
-    for(auto fieldPair : il->fields) {
-      Realm::FieldID fid = fieldPair.first;
-      Realm::Event copyEvt = realmCopy_int(*((Realm::RegionInstance *)data_region), R, fid, regEvt);
-      ctx->mem_events.insert(copyEvt);
-    }
-    std::cout << "Finished copy" << std::endl;
+    //for(auto fieldPair : il->fields) {
+    // Realm::FieldID fid = fieldPair.first;
+    //Realm::Event copyEvt = realmCopy_int(*((Realm::RegionInstance *)data_region), R, fid, regEvt);
+    //ctx->mem_events.insert(copyEvt);
+    //}
+    //std::cout << "Finished copy" << std::endl;
 
     //register the task with the runtime
     Realm::Event e1 = p.register_task(taskID, cd, prs, user_data, user_data_len);
@@ -265,19 +275,19 @@ extern "C" {
     std::cout << "Added the spawn event to the context's set of Events" << std::endl;
 
     //copy the data back over
-    for(auto fieldPair : il->fields) {
-      Realm::FieldID fid = fieldPair.first;
-      Realm::Event copyBackEvt = realmCopy_int(R,*((Realm::RegionInstance *)data_region), fid, e2); //predicated on completion of spawned task
-      ctx->mem_events.insert(copyBackEvt);
-    }
+    //for(auto fieldPair : il->fields) {
+    //  Realm::FieldID fid = fieldPair.first;
+    //  Realm::Event copyBackEvt = realmCopy_int(R,*((Realm::RegionInstance *)data_region), fid, e2); //predicated on completion of spawned task
+    //  ctx->mem_events.insert(copyBackEvt);
+    //}
 
     //free the newly created region after copy back finishes
-    Realm::Event allDone = mem_sync();
-    while (! allDone.has_triggered()) {
-      std::cout << "realmSpawn allDone event has NOT TRIGGERED" << std::endl;
-      continue;
-    }
-    realmDestroyRegion((void*) &R);
+    //Realm::Event allDone = mem_sync();
+    //while (! allDone.has_triggered()) {
+    //std::cout << "realmSpawn allDone event has NOT TRIGGERED" << std::endl;
+    // continue;
+    //}
+    //realmDestroyRegion((void*) &R);
 
     return;
   }
