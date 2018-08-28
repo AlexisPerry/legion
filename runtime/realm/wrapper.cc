@@ -50,7 +50,7 @@ extern "C" {
     return;
   }
 
-
+#if 0
   //realmCreateRegion
   void* realmCreateRegion_int(int* data) {
 
@@ -182,9 +182,21 @@ extern "C" {
 						      wait_for);
   }
 
+  //helper - makes a Realm::Processor::TaskFuncPtr out of available things
+  void canonicalTask(const void *args, size_t arglen, void *user_data, size_t user_data_len, Realm::Processor p);
+  void canonicalTask(const void *args, size_t arglen, void *user_data, size_t user_data_len, Realm::Processor p){}
+  Realm::Processor::TaskFuncPtr makeCanonicalTask(const void *args, size_t arglen, void *user_data, size_t user_data_len, Realm::Processor p);
+  makeCanonicalTask(const void *args, size_t arglen, void *user_data, size_t user_data_len, Realm::Processor p){
+    Realm::Processor::TaskFuncPtr task = 
+      return task;
+  }
+#endif
+
   //NOTE: this is for integers for now
   //void realmSpawn(void (*func)(void), 
-  void realmSpawn(const char *lib_name, const char *symbol_name, 
+  //void realmSpawn(const char *lib_name, const char *symbol_name, 
+  void realmSpawn(Realm::Processor::TaskFuncPtr func, const void* args, size_t arglen, void* user_data, size_t user_data_len);
+  void realmSpawn(Realm::Processor::TaskFuncPtr func, 
 		  const void* args, 
 		  size_t arglen, 
 		  void* user_data, 
@@ -206,22 +218,6 @@ extern "C" {
     Realm::Processor::TaskFuncID taskID = ctx->cur_task;
     std::cout << "created the taskID" << std::endl;
 
-    //takes fxn ptr, turns it into a TypeConv::from_cpp_type<TaskFuncPtr>()
-    // the CodeDescriptor needs to be of that type
-    // orig:     Realm::CodeDescriptor cd = Realm::CodeDescriptor(func);
-
-    Realm::CodeDescriptor cd = Realm::CodeDescriptor(Realm::TypeConv::from_cpp_type<Realm::Processor::TaskFuncPtr>());
-    std::cout << "Created CodeDescriptor" << std::endl;
-    //Realm::FunctionPointerImplementation fpi = Realm::FunctionPointerImplementation(func);
-    //std::cout << "Created FunctionPointerImplementation" << std::endl;
-    Realm::DSOReferenceImplementation fpi = Realm::DSOReferenceImplementation(std::string(lib_name), std::string(symbol_name));
-    cd.add_implementation(&fpi);
-    std::cout << "added the implementation to the CodeDescriptor" << std::endl;
-    //cd.add_implementation(Realm::FunctionPointerImplementation(func).clone());
-
-    const Realm::ProfilingRequestSet prs;  //We don't care what it is for now, the default is fine
-    std::cout << "Created a default ProfilingRequestSet" << std::endl;
-
     //get a processor to run on
     Realm::Machine::ProcessorQuery procquery(Realm::Machine::get_machine());
     Realm::Processor p = procquery.local_address_space().random();
@@ -231,6 +227,25 @@ extern "C" {
     Realm::Machine::MemoryQuery memquery(Realm::Machine::get_machine());
     Realm::Memory m = memquery.local_address_space().best_affinity_to(p).random();
     assert ( m != Realm::Memory::NO_MEMORY); //assert that the memory exists
+
+    //takes fxn ptr, turns it into a TypeConv::from_cpp_type<TaskFuncPtr>()
+    // the CodeDescriptor needs to be of that type
+
+    // orig:  
+    Realm::CodeDescriptor cd = Realm::CodeDescriptor(func);
+    //old: Realm::CodeDescriptor cd = Realm::CodeDescriptor(Realm::TypeConv::from_cpp_type<Realm::Processor::TaskFuncPtr>());
+    //canonicalTask(args, arglen, user_data, user_data_len, p);
+    //Realm::CodeDescriptor cd = Realm::CodeDescriptor(canonicalTask);
+    std::cout << "Created CodeDescriptor" << std::endl;
+    //Realm::FunctionPointerImplementation fpi = Realm::FunctionPointerImplementation(func);
+    //std::cout << "Created FunctionPointerImplementation" << std::endl;
+    //Realm::DSOReferenceImplementation fpi = Realm::DSOReferenceImplementation(std::string(lib_name), std::string(symbol_name));
+    //cd.add_implementation(&fpi);
+    //std::cout << "added the implementation to the CodeDescriptor" << std::endl;
+
+    const Realm::ProfilingRequestSet prs;  //We don't care what it is for now, the default is fine
+    std::cout << "Created a default ProfilingRequestSet" << std::endl;
+
 
     //create a physical region for the copy
     //predicate creation of this region on the creation and initialization of the old region
@@ -269,7 +284,7 @@ extern "C" {
     std::cout << "Added the register_task event to the context's set of Events" << std::endl;
 
     //spawn the task
-    Realm::Event e2 = p.spawn(taskID, args, arglen, mem_sync(), 0); //predicated on the creation and initialization of the region 
+    Realm::Event e2 = p.spawn(taskID, args, arglen, e1, 0); 
     std::cout << "Spawned the task" << std::endl;
     ctx->events.insert(e2);
     std::cout << "Added the spawn event to the context's set of Events" << std::endl;
