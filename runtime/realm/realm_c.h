@@ -97,12 +97,7 @@ typedef
 typedef struct context context;
 context* getRealmCTX();
 void realmInitRuntime(int argc, char** argv);
-  //void* realmCreateRegion_int(int* data);
-  //void* realmCreateRegion_double(double* data);
-  //void realmDestroyRegion(void *region);
-//void realmSpawn(void (*func) (), const void* args, size_t arglen, void* user_data, size_t user_data_len, void* data_region);
-//void realmSpawn(const char* lib_name, const char* symbol_name, const void* args, size_t arglen, void* user_data, size_t user_data_len);
-
+//NOTE: realmSpawn declared and defined in wrapper.cc
 void realmSync();
 // end APERRY
 #ifdef __cplusplus
