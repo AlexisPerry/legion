@@ -608,6 +608,16 @@ namespace Realm {
   {}
 
   template <int N, typename T> __CUDA_HD__
+  inline void PointInRectIterator<N,T>::reset(const Rect<N,T>& _r,
+					      bool _fortran_order /*= true*/)
+  {
+    p = _r.lo;
+    valid = !_r.empty();
+    rect = _r;
+    fortran_order = _fortran_order;
+  }
+
+  template <int N, typename T> __CUDA_HD__
   inline bool PointInRectIterator<N,T>::step(void)
   {
     assert(valid);  // can't step an iterator that's already done
@@ -641,6 +651,195 @@ namespace Realm {
     // if we fall through, we're out of points
     valid = false;
     return false;
+  }
+
+
+  ////////////////////////////////////////////////////////////////////////
+  //
+  // struct CopySrcDstField
+
+  inline CopySrcDstField::CopySrcDstField(void)
+    : inst(RegionInstance::NO_INST)
+    , field_id(FieldID(-1))
+    , size(0)
+    , redop_id(0)
+    , red_fold(false)
+    , serdez_id(0)
+    , subfield_offset(0)
+    , indirect_index(-1)
+  {
+    fill_data.indirect = 0;
+  }
+
+  inline CopySrcDstField::CopySrcDstField(const CopySrcDstField& copy_from)
+    : inst(copy_from.inst)
+    , field_id(copy_from.field_id)
+    , size(copy_from.size)
+    , redop_id(copy_from.redop_id)
+    , red_fold(copy_from.red_fold)
+    , serdez_id(copy_from.serdez_id)
+    , subfield_offset(copy_from.subfield_offset)
+    , indirect_index(copy_from.indirect_index)
+  {
+    // we know there's a fill value if the field ID is -1
+    if(copy_from.field_id == FieldID(-1)) {
+      if(size <= MAX_DIRECT_SIZE) {
+	// copy whole buffer to make sure indirect is initialized too
+	memcpy(fill_data.direct, copy_from.fill_data.direct, MAX_DIRECT_SIZE);
+      } else {
+	if(copy_from.fill_data.indirect) {
+	  fill_data.indirect = malloc(size);
+	  memcpy(fill_data.indirect, copy_from.fill_data.indirect, size);
+	} else
+	  fill_data.indirect = 0;
+      }
+    } else
+      fill_data.indirect = 0;
+  }
+
+  inline CopySrcDstField& CopySrcDstField::operator=(const CopySrcDstField& copy_from)
+  {
+    if((field_id != FieldID(-1)) && (size > MAX_DIRECT_SIZE) && fill_data.indirect)
+      free(fill_data.indirect);
+
+    inst = copy_from.inst;
+    field_id = copy_from.field_id;
+    size = copy_from.size;
+    redop_id = copy_from.redop_id;
+    red_fold = copy_from.red_fold;
+    serdez_id = copy_from.serdez_id;
+    subfield_offset = copy_from.subfield_offset;
+    indirect_index = copy_from.indirect_index;
+
+    // we know there's a fill value if the field ID is -1
+    if(copy_from.field_id == FieldID(-1)) {
+      if(size <= MAX_DIRECT_SIZE) {
+	// copy whole buffer to make sure indirect is initialized too
+	memcpy(fill_data.direct, copy_from.fill_data.direct, MAX_DIRECT_SIZE);
+      } else {
+	if(copy_from.fill_data.indirect) {
+	  fill_data.indirect = malloc(size);
+	  memcpy(fill_data.indirect, copy_from.fill_data.indirect, size);
+	} else
+	  fill_data.indirect = 0;
+      }
+    } else
+      fill_data.indirect = 0;
+
+    return *this;
+  }
+
+  inline CopySrcDstField::~CopySrcDstField(void)
+  {
+    if((field_id == FieldID(-1)) && (size > MAX_DIRECT_SIZE)) {
+      free(fill_data.indirect);
+    }
+  }
+
+  inline CopySrcDstField &CopySrcDstField::set_field(RegionInstance _inst,
+						     FieldID _field_id,
+						     size_t _size,
+						     size_t _subfield_offset /*= 0*/)
+  {
+    inst = _inst;
+    field_id = _field_id;
+    size = _size;
+    subfield_offset = _subfield_offset;
+    return *this;
+  }
+
+  inline CopySrcDstField &CopySrcDstField::set_indirect(int _indirect_index,
+							FieldID _field_id,
+							size_t _size,
+							size_t _subfield_offset /*= 0*/)
+  {
+    indirect_index = _indirect_index;
+    field_id = _field_id;
+    size = _size;
+    subfield_offset = _subfield_offset;
+    return *this;
+  }
+
+  inline CopySrcDstField &CopySrcDstField::set_redop(ReductionOpID _redop_id, bool _is_fold)
+  {
+    redop_id = _redop_id;
+    red_fold = _is_fold;
+    return *this;
+  }
+
+  inline CopySrcDstField &CopySrcDstField::set_serdez(CustomSerdezID _serdez_id)
+  {
+    serdez_id = _serdez_id;
+    return *this;
+  }
+  
+  inline CopySrcDstField &CopySrcDstField::set_fill(const void *_data, size_t _size)
+  {
+    size = _size;
+    if(size <= MAX_DIRECT_SIZE) {
+      memcpy(&fill_data.direct, _data, size);
+    } else {
+      fill_data.indirect = malloc(size);
+      memcpy(fill_data.indirect, _data, size);
+    }
+    return *this;
+  }
+
+  template <typename T>
+  inline CopySrcDstField &CopySrcDstField::set_fill(T value)
+  {
+    return set_fill(&value, sizeof(T));
+  }
+
+  template <typename S>
+  inline bool serialize(S& s, const CopySrcDstField& v)
+  {
+    if(!((s << v.inst) &&
+	 (s << v.field_id) &&
+	 (s << v.size) &&
+	 (s << v.redop_id) &&
+	 (s << v.red_fold) &&
+	 (s << v.serdez_id) &&
+	 (s << v.subfield_offset) &&
+	 (s << v.indirect_index))) return false;
+
+    // we know there's a fill value if the field ID is -1
+    if(v.field_id == FieldID(-1)) {
+      if(!s.append_bytes(((v.size <= CopySrcDstField::MAX_DIRECT_SIZE) ?
+			    v.fill_data.direct :
+			    v.fill_data.indirect),
+			 v.size))
+	return false;
+    }
+
+    return true;
+  }
+
+  template <typename S>
+  inline bool deserialize(S& s, CopySrcDstField& v)
+  {
+    if(!((s >> v.inst) &&
+	 (s >> v.field_id) &&
+	 (s >> v.size) &&
+	 (s >> v.redop_id) &&
+	 (s >> v.red_fold) &&
+	 (s >> v.serdez_id) &&
+	 (s >> v.subfield_offset) &&
+	 (s >> v.indirect_index))) return false;
+
+    // we know there's a fill value if the field ID is -1
+    if(v.field_id == FieldID(-1)) {
+      if(v.size <= CopySrcDstField::MAX_DIRECT_SIZE) {
+	if(!s.extract_bytes(v.fill_data.direct, v.size))
+	  return false;
+      } else {
+	v.fill_data.indirect = malloc(v.size);
+	if(!s.extract_bytes(v.fill_data.indirect, v.size))
+	  return false;
+      }
+    }
+
+    return true;
   }
 
 
@@ -961,23 +1160,24 @@ namespace Realm {
   template <int N, typename T>
   inline bool IndexSpace<N,T>::overlaps(const IndexSpace<N,T>& other) const
   {
-    if(dense()) {
-      if(other.dense()) {
-	// just test bounding boxes
-	return bounds.overlaps(other.bounds);
-      } else {
-	// have the other guy test against our bounding box
-	return other.contains_any(bounds);
-      }
-    } else {
-      if(other.dense()) {
-	return contains_any(other.bounds);
-      } else {
-	// nasty case - both sparse
-	assert(0);
-	return true;
-      }
-    }
+    // this covers the both-dense case as well as the same-sparsity-map case
+    if(sparsity == other.sparsity)
+      return bounds.overlaps(other.bounds);
+
+    // dense vs. sparse in both directions
+    if(dense())
+      return other.contains_any(bounds);
+
+    if(other.dense())
+      return contains_any(other.bounds);
+
+    // both sparse case can be expensive...
+    SparsityMapPublicImpl<N,T> *impl = sparsity.impl();
+    SparsityMapPublicImpl<N,T> *other_impl = other.sparsity.impl();
+    // overlap can only be within intersecion of bounds
+    Rect<N,T> isect = bounds.intersection(other.bounds);
+
+    return impl->overlaps(other_impl, isect, false /*!approx*/);
   }
 
   // actual number of points in index space (may be less than volume of bounding box)
@@ -1086,23 +1286,24 @@ namespace Realm {
   template <int N, typename T>
   inline bool IndexSpace<N,T>::overlaps_approx(const IndexSpace<N,T>& other) const
   {
-    if(dense()) {
-      if(other.dense()) {
-	// just test bounding boxes
-	return bounds.overlaps(other.bounds);
-      } else {
-	// have the other guy test against our bounding box
-	return other.contains_any_approx(bounds);
-      }
-    } else {
-      if(other.dense()) {
-	return contains_any_approx(other.bounds);
-      } else {
-	// nasty case - both sparse
-	assert(0);
-	return true;
-      }
-    }
+    // this covers the both-dense case as well as the same-sparsity-map case
+    if(sparsity == other.sparsity)
+      return bounds.overlaps(other.bounds);
+
+    // dense vs. sparse in both directions
+    if(dense())
+      return other.contains_any_approx(bounds);
+
+    if(other.dense())
+      return contains_any_approx(other.bounds);
+
+    // both sparse case can be expensive...
+    SparsityMapPublicImpl<N,T> *impl = sparsity.impl();
+    SparsityMapPublicImpl<N,T> *other_impl = other.sparsity.impl();
+    // overlap can only be within intersecion of bounds
+    Rect<N,T> isect = bounds.intersection(other.bounds);
+
+    return impl->overlaps(other_impl, isect, true /*approx*/);
   }
 
   // approximage number of points in index space (may be less than volume of bounding box, but larger than
@@ -1127,17 +1328,63 @@ namespace Realm {
   // copy and fill operations
 
   template <int N, typename T>
-  inline Event IndexSpace<N,T>::copy(const std::vector<CopySrcDstField> &srcs,
-				      const std::vector<CopySrcDstField> &dsts,
-				      const IndexSpace<N,T> &mask,
-				      const ProfilingRequestSet &requests,
-				      Event wait_on /*= Event::NO_EVENT*/,
-				      ReductionOpID redop_id /*= 0*/,
-				      bool red_fold /*= false*/) const
+  inline Event IndexSpace<N,T>::fill(const std::vector<CopySrcDstField> &dsts,
+				     const Realm::ProfilingRequestSet &requests,
+				     const void *fill_value, size_t fill_value_size,
+				     Event wait_on /*= Event::NO_EVENT*/) const
   {
-    assert(0);
-    return wait_on;
+    std::vector<CopySrcDstField> srcs;
+    srcs.resize(dsts.size());
+    size_t offset = 0;
+    for(size_t i = 0; i < dsts.size(); i++) {
+      assert((offset + dsts[i].size) <= fill_value_size);
+      srcs[i].set_fill(reinterpret_cast<const char *>(fill_value) + offset,
+		       dsts[i].size);
+      // special case: if a field uses all of the fill value, the next
+      //  field (if any) is allowed to use the same value
+      if((offset > 0) || (dsts[i].size != fill_value_size))
+	offset += dsts[i].size;
+    }
+    return copy(srcs, dsts,
+		std::vector<const typename CopyIndirection<N,T>::Base *>(),
+		requests, wait_on);
   }
+
+  template <int N, typename T>
+  inline Event IndexSpace<N,T>::copy(const std::vector<CopySrcDstField> &srcs,
+				     const std::vector<CopySrcDstField> &dsts,
+				     const ProfilingRequestSet &requests,
+				     Event wait_on,
+				     ReductionOpID redop_id,
+				     bool red_fold /*= false*/) const
+  {
+    if(redop_id == 0) {
+      // passthrough
+      return copy(srcs, dsts,
+		  std::vector<const typename CopyIndirection<N,T>::Base *>(),
+		  requests, wait_on);
+    } else {
+      // copy reduction op into dst fields
+      std::vector<CopySrcDstField> dsts2(dsts);
+      for(size_t i = 0; i < dsts2.size(); i++)
+	dsts2[i].set_redop(redop_id, red_fold);
+      return copy(srcs, dsts2,
+		  std::vector<const typename CopyIndirection<N,T>::Base *>(),
+		  requests, wait_on);
+    }
+  }
+
+  template <int N, typename T>
+  inline Event IndexSpace<N,T>::copy(const std::vector<CopySrcDstField> &srcs,
+				     const std::vector<CopySrcDstField> &dsts,
+				     const ProfilingRequestSet &requests,
+				     Event wait_on /*= Event::NO_EVENT*/) const
+  {
+    return copy(srcs, dsts,
+		std::vector<const typename CopyIndirection<N,T>::Base *>(),
+		requests, wait_on);
+  }
+
 
   // simple wrapper for the multiple subspace version
   template <int N, typename T>

@@ -81,8 +81,8 @@ namespace Realm {
 
     Memory RegionInstance::get_location(void) const
     {
-      RegionInstanceImpl *i_impl = get_runtime()->get_instance_impl(*this);
-      return i_impl->memory;
+      return ID::make_memory(ID(id).instance.owner_node,
+			     ID(id).instance.mem_idx).convert<Memory>();
     }
 
     /*static*/ Event RegionInstance::create_instance(RegionInstance& inst,
@@ -116,6 +116,10 @@ namespace Realm {
 	GenEventImpl::trigger(ready_event, true /*poisoned*/);
 	return ready_event;
       }
+
+      // set this handle before we do anything that can result in a
+      //  profiling callback containing this instance handle
+      inst = impl->me;
 
       impl->metadata.layout = ilg;
       
@@ -177,7 +181,6 @@ namespace Realm {
 	}
       }
 
-      inst = impl->me;
       log_inst.info() << "instance created: inst=" << inst << " bytes=" << ilg->bytes_used << " ready=" << ready_event;
       log_inst.debug() << "instance layout: inst=" << inst << " layout=" << *ilg;
       return ready_event;
@@ -446,6 +449,16 @@ namespace Realm {
 			       measurements.wants_measurement<ProfilingMeasurements::InstanceAllocResult>());
 	if(report_failure) {
 	  log_inst.info() << "allocation failed: inst=" << me;
+
+	  // poison the completion event, if it exists
+	  Event ready_event = Event::NO_EVENT;
+	  {
+	    AutoHSLLock al(mutex);
+	    ready_event = metadata.ready_event;
+	    metadata.ready_event = Event::NO_EVENT;
+	    metadata.inst_offset = (size_t)-2;
+	  }
+
 	  if(measurements.wants_measurement<ProfilingMeasurements::InstanceStatus>()) {
 	    ProfilingMeasurements::InstanceStatus stat;
 	    stat.result = ProfilingMeasurements::InstanceStatus::FAILED_ALLOCATION;
@@ -465,14 +478,6 @@ namespace Realm {
           // clear the measurments after we send the response
           measurements.clear();
 
-	  // poison the completion event, if it exists
-	  Event ready_event = Event::NO_EVENT;
-	  {
-	    AutoHSLLock al(mutex);
-	    ready_event = metadata.ready_event;
-	    metadata.ready_event = Event::NO_EVENT;
-	    metadata.inst_offset = (size_t)-2;
-	  }
 	  if(ready_event.exists())
 	    GenEventImpl::trigger(ready_event, true /*poisoned*/);
 	  return;
@@ -536,23 +541,23 @@ namespace Realm {
     {
       log_inst.debug() << "deallocation completed: inst=" << me;
 
-      if (measurements.wants_measurement<ProfilingMeasurements::InstanceStatus>()) {
-	ProfilingMeasurements::InstanceStatus stat;
-	stat.result = ProfilingMeasurements::InstanceStatus::DESTROYED_SUCCESSFULLY;
-	stat.error_code = 0;
-	measurements.add_measurement(stat);
-      }
-
-      if (measurements.wants_measurement<ProfilingMeasurements::InstanceTimeline>()) {
-	timeline.record_delete_time();
-	measurements.add_measurement(timeline);
-      }
-
-      // send any remaining incomplete profiling responses
-      measurements.send_responses(requests);
-
       // was this a successfully allocatated instance?
       if(metadata.inst_offset != size_t(-2)) {
+	if (measurements.wants_measurement<ProfilingMeasurements::InstanceStatus>()) {
+	  ProfilingMeasurements::InstanceStatus stat;
+	  stat.result = ProfilingMeasurements::InstanceStatus::DESTROYED_SUCCESSFULLY;
+	  stat.error_code = 0;
+	  measurements.add_measurement(stat);
+	}
+
+	if (measurements.wants_measurement<ProfilingMeasurements::InstanceTimeline>()) {
+	  timeline.record_delete_time();
+	  measurements.add_measurement(timeline);
+	}
+
+	// send any remaining incomplete profiling responses
+	measurements.send_responses(requests);
+
 	// send any required invalidation messages for metadata
 	bool recycle_now = metadata.initiate_cleanup(me.id);
 	if(recycle_now)

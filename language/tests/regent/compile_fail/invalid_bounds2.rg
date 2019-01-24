@@ -13,7 +13,7 @@
 -- limitations under the License.
 
 -- fails-with:
--- invalid_bounds2.rg:27: no field 'bounds' in type region(int32)
+-- invalid_bounds2.rg:27: no field 'bounds' in type ispace(ptr)
 --   var bounds = r.bounds
 --                 ^
 

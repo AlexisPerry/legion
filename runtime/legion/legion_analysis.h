@@ -182,8 +182,12 @@ namespace Legion {
     public:
       static const LgTaskID TASK_ID = LG_ADD_VERSIONING_SET_REF_TASK_ID;
     public:
-      VersionState *state;
-      ReferenceSource kind;
+      VersioningSetRefArgs(VersionState *s, ReferenceSource k)
+        : LgTaskArgs<VersioningSetRefArgs>(implicit_provenance),
+          state(s), kind(k) { }
+    public:
+      VersionState *const state;
+      const ReferenceSource kind;
     };
 
     // Small typedef to define field versions
@@ -374,16 +378,16 @@ namespace Legion {
     };
 
     /**
-     * \struct TracingInfo
+     * \struct LogicalTraceInfo
      * Information about tracing needed for logical
      * dependence analysis.
      */
-    struct TraceInfo {
+    struct LogicalTraceInfo {
     public:
-      TraceInfo(bool already_tr,
-                LegionTrace *tr,
-                unsigned idx,
-                const RegionRequirement &r);
+      LogicalTraceInfo(bool already_tr,
+                       LegionTrace *tr,
+                       unsigned idx,
+                       const RegionRequirement &r);
     public:
       bool already_traced;
       LegionTrace *trace;
@@ -468,6 +472,18 @@ namespace Legion {
     }; 
 
     /**
+     * \struct PhysicalTraceInfo
+     */
+    struct PhysicalTraceInfo {
+    public:
+      PhysicalTraceInfo();
+    public:
+      bool recording;
+      Operation *op;
+      PhysicalTemplate *tpl;
+    };
+
+    /**
      * \struct TraversalInfo
      */
     struct TraversalInfo {
@@ -485,6 +501,7 @@ namespace Legion {
       const FieldMask traversal_mask;
       const UniqueID context_uid;
       std::set<RtEvent> &map_applied_events;
+      ContextID logical_ctx;
     };
 
     /**
@@ -540,7 +557,11 @@ namespace Legion {
       bool projection_domain_dominates(IndexSpaceNode *next_space) const;
     public:
       void print_state(TreeStateLogger *logger, 
-                       const FieldMask &capture_mask) const;
+                       const FieldMask &capture_mask,
+                       RegionNode *node) const;
+      void print_state(TreeStateLogger *logger, 
+                       const FieldMask &capture_mask,
+                       PartitionNode *node) const;
     public:
       OpenState open_state;
       ReductionOpID redop;
@@ -677,6 +698,14 @@ namespace Legion {
       static ClosedNode* unpack_closed_node(Deserializer &derez, 
                                             Runtime *runtime, bool is_region);
     public:
+      void record_closed_tree(
+          const FieldMask &fields, ContextID logical_ctx,
+          LegionMap<std::pair<RegionTreeNode*,ContextID>,
+                    FieldMask>::aligned &closed_nodes,
+          std::map<std::pair<RegionTreeNode*,ContextID>,
+                   LegionMap<IndexSpaceNode*,FieldMask>::aligned>
+                   &closed_projections);
+    public:
       RegionTreeNode *const node;
     protected:
       FieldMask valid_fields; // Fields that are summarized in this tree
@@ -720,7 +749,7 @@ namespace Legion {
       void initialize_close_operations(LogicalState &state, 
                                        Operation *creator,
                                        const VersionInfo &version_info,
-                                       const TraceInfo &trace_info);
+                                       const LogicalTraceInfo &trace_info);
       void perform_dependence_analysis(const LogicalUser &current,
                                        const FieldMask &open_below,
              LegionList<LogicalUser,CURR_LOGICAL_ALLOC>::track_aligned &cusers,
@@ -825,7 +854,6 @@ namespace Legion {
                     std::set<RtEvent> &ready_events) const;
     public:
       void print_physical_state(const FieldMask &capture_mask,
-          LegionMap<LegionColor,FieldMask>::aligned &to_traverse,
                                 TreeStateLogger *logger);
     public:
       RegionTreeNode *const node;
@@ -886,17 +914,25 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_VERSION_STATE_CAPTURE_DIRTY_TASK_ID;
       public:
-        VersionState *previous;
-        VersionState *target;
-        FieldMask *capture_mask;
+        DirtyUpdateArgs(VersionState *prev, VersionState *tar, FieldMask *mask)
+          : LgTaskArgs<DirtyUpdateArgs>(implicit_provenance),
+            previous(prev), target(tar), capture_mask(mask) { }
+      public:
+        VersionState *const previous;
+        VersionState *const target;
+        FieldMask *const capture_mask;
       };
       struct PendingAdvanceArgs : public LgTaskArgs<PendingAdvanceArgs> {
       public:
         static const LgTaskID TASK_ID = 
           LG_VERSION_STATE_PENDING_ADVANCE_TASK_ID;
       public:
-        VersionManager *proxy_this;
-        RtEvent to_reclaim;
+        PendingAdvanceArgs(VersionManager *proxy, RtEvent reclaim)
+          : LgTaskArgs<PendingAdvanceArgs>(implicit_provenance),
+            proxy_this(proxy), to_reclaim(reclaim) { }
+      public:
+        VersionManager *const proxy_this;
+        const RtEvent to_reclaim;
       };
     public:
       static const AllocationType alloc_type = VERSION_MANAGER_ALLOC;
@@ -972,8 +1008,9 @@ namespace Legion {
     public:
       void print_physical_state(RegionTreeNode *node,
                                 const FieldMask &capture_mask,
-                         LegionMap<LegionColor,FieldMask>::aligned &to_traverse,
                                 TreeStateLogger *logger);
+    public:
+      void update_physical_state(PhysicalState *state);
     protected:
       VersionState* create_new_version_state(VersionID vid);
     public:
@@ -1096,34 +1133,55 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_SEND_VERSION_STATE_UPDATE_TASK_ID;
       public:
-        VersionState *proxy_this;
-        AddressSpaceID target;
-        InnerContext *context;
-        FieldMask *request_mask;
-        VersionRequestKind request_kind;
-        RtUserEvent to_trigger;
+        SendVersionStateArgs(VersionState *proxy, AddressSpaceID tar,
+                             InnerContext *ctx, FieldMask *mask,
+                             VersionRequestKind k, RtUserEvent trig)
+          : LgTaskArgs<SendVersionStateArgs>(implicit_provenance),
+            proxy_this(proxy), target(tar), context(ctx), request_mask(mask),
+            request_kind(k), to_trigger(trig) { }
+      public:
+        VersionState *const proxy_this;
+        const AddressSpaceID target;
+        InnerContext *const context;
+        FieldMask *const request_mask;
+        const VersionRequestKind request_kind;
+        const RtUserEvent to_trigger;
       };
       struct UpdateStateReduceArgs : public LgTaskArgs<UpdateStateReduceArgs> {
       public:
         static const LgTaskID TASK_ID = LG_UPDATE_VERSION_STATE_REDUCE_TASK_ID;
       public:
-        VersionState *proxy_this;
-        LegionColor child_color;
-        VersioningSet<> *children;
+        UpdateStateReduceArgs(VersionState *proxy, LegionColor color,
+                              VersioningSet<> *child)
+          : LgTaskArgs<UpdateStateReduceArgs>(implicit_provenance),
+            proxy_this(proxy), child_color(color), children(child) { }
+      public:
+        VersionState *const proxy_this;
+        const LegionColor child_color;
+        VersioningSet<> *const children;
       };
       struct ConvertViewArgs : public LgTaskArgs<ConvertViewArgs> {
       public:
         static const LgTaskID TASK_ID = LG_CONVERT_VIEW_TASK_ID;
       public:
-        VersionState *proxy_this;
-        PhysicalManager *manager;
-        InnerContext *context;
+        ConvertViewArgs(VersionState *proxy, PhysicalManager *man,
+                        InnerContext *ctx)
+          : LgTaskArgs<ConvertViewArgs>(implicit_provenance),
+            proxy_this(proxy), manager(man), context(ctx) { }
+      public:
+        VersionState *const proxy_this;
+        PhysicalManager *const manager;
+        InnerContext *const context;
       };
       struct UpdateViewReferences : public LgTaskArgs<UpdateViewReferences> {
       public:
         static const LgTaskID TASK_ID = LG_UPDATE_VIEW_REFERENCES_TASK_ID;
       public:
-        DistributedID did;
+        UpdateViewReferences(DistributedID id)
+          : LgTaskArgs<UpdateViewReferences>(implicit_provenance),
+            did(id) { }
+      public:
+        const DistributedID did;
         LogicalView *view;
       }; 
       struct RemoveVersionStateRefArgs : 
@@ -1131,8 +1189,12 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_REMOVE_VERSION_STATE_REF_TASK_ID;
       public:
-        VersionState *proxy_this;
-        ReferenceSource ref_kind;
+        RemoveVersionStateRefArgs(VersionState *proxy, ReferenceSource kind)
+          : LgTaskArgs<RemoveVersionStateRefArgs>(implicit_provenance),
+            proxy_this(proxy), ref_kind(kind) { }
+      public:
+        VersionState *const proxy_this;
+        const ReferenceSource ref_kind;
       };
       template<VersionRequestKind KIND>
       struct RequestFunctor {
@@ -1638,7 +1700,11 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_DEFER_RESTRICTED_MANAGER_TASK_ID;
       public:
-        PhysicalManager *manager;
+        DeferRestrictedManagerArgs(PhysicalManager *man)
+          : LgTaskArgs<DeferRestrictedManagerArgs>(implicit_provenance),
+            manager(man) { }
+      public:
+        PhysicalManager *const manager;
       };
     public:
       RestrictInfo(void);

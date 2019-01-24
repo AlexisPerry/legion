@@ -24,6 +24,7 @@ except ImportError:
     import pickle
 import collections
 import itertools
+import math
 import numpy
 import os
 import re
@@ -113,7 +114,7 @@ def input_args(filter_runtime_options=False):
 
     args = []
     for i in range(raw_args.argc):
-        args.append(ffi.string(raw_args.argv[i]))
+        args.append(ffi.string(raw_args.argv[i]).decode('utf-8'))
 
     if filter_runtime_options:
         i = 1 # Skip program name
@@ -188,15 +189,63 @@ class Domain(object):
         return self.impl
 
 class Future(object):
-    __slots__ = ['handle', 'value_type']
-    def __init__(self, handle, value_type=None):
-        self.handle = c.legion_future_copy(handle)
+    __slots__ = ['handle', 'value_type', 'argument_number']
+    def __init__(self, value, value_type=None, argument_number=None):
+        if value is None:
+            self.handle = None
+        elif isinstance(value, Future):
+            value.resolve_handle()
+            self.handle = c.legion_future_copy(value.handle)
+            if value_type is None:
+                value_type = value.value_type
+        elif value_type is not None:
+            if value_type.size > 0:
+                value_ptr = ffi.new(ffi.getctype(value_type.cffi_type, '*'), value)
+            else:
+                value_ptr = ffi.NULL
+            value_size = value_type.size
+            self.handle = c.legion_future_from_untyped_pointer(_my.ctx.runtime, value_ptr, value_size)
+        else:
+            value_str = pickle.dumps(value, protocol=_pickle_version)
+            value_size = len(value_str)
+            value_ptr = ffi.new('char[]', value_size)
+            ffi.buffer(value_ptr, value_size)[:] = value_str
+            self.handle = c.legion_future_from_untyped_pointer(_my.ctx.runtime, value_ptr, value_size)
+
         self.value_type = value_type
+        self.argument_number = argument_number
+
+    @staticmethod
+    def from_cdata(value, *args, **kwargs):
+        result = Future(None, *args, **kwargs)
+        result.handle = c.legion_future_copy(value)
+        return result
+
+    @staticmethod
+    def from_buffer(value, *args, **kwargs):
+        result = Future(None, *args, **kwargs)
+        result.handle = c.legion_future_from_untyped_pointer(_my.ctx.runtime, ffi.from_buffer(value), len(value))
+        return result
 
     def __del__(self):
-        c.legion_future_destroy(self.handle)
+        if self.handle is not None:
+            c.legion_future_destroy(self.handle)
+
+    def __reduce__(self):
+        if self.argument_number is None:
+            raise Exception('Cannot pickle a Future except when used as a task argument')
+        return (Future, (None, self.value_type, self.argument_number))
+
+    def resolve_handle(self):
+        if self.handle is None and self.argument_number is not None:
+            self.handle = c.legion_future_copy(
+                c.legion_task_get_future(_my.ctx.task, self.argument_number))
 
     def get(self):
+        self.resolve_handle()
+
+        if self.handle is None:
+            return
         if self.value_type is None:
             value_ptr = c.legion_future_get_untyped_pointer(self.handle)
             value_size = c.legion_future_get_untyped_size(self.handle)
@@ -204,47 +253,66 @@ class Future(object):
             value_str = ffi.unpack(ffi.cast('char *', value_ptr), value_size)
             value = pickle.loads(value_str)
             return value
+        elif self.value_type.size == 0:
+            c.legion_future_get_void_result(self.handle)
         else:
-            expected_size = ffi.sizeof(self.value_type)
+            expected_size = ffi.sizeof(self.value_type.cffi_type)
 
             value_ptr = c.legion_future_get_untyped_pointer(self.handle)
             value_size = c.legion_future_get_untyped_size(self.handle)
             assert value_size == expected_size
-            value = ffi.cast(ffi.getctype(self.value_type, '*'), value_ptr)[0]
+            value = ffi.cast(ffi.getctype(self.value_type.cffi_type, '*'), value_ptr)[0]
             return value
 
+    def get_buffer(self):
+        self.resolve_handle()
+
+        if self.handle is None:
+            return
+        value_ptr = c.legion_future_get_untyped_pointer(self.handle)
+        value_size = c.legion_future_get_untyped_size(self.handle)
+        return ffi.buffer(value_ptr, value_size)
+
 class FutureMap(object):
-    __slots__ = ['handle']
-    def __init__(self, handle):
+    __slots__ = ['handle', 'value_type']
+    def __init__(self, handle, value_type=None):
         self.handle = c.legion_future_map_copy(handle)
+        self.value_type = value_type
 
     def __del__(self):
         c.legion_future_map_destroy(self.handle)
 
     def __getitem__(self, point):
         domain_point = DomainPoint(_IndexValue(point))
-        return Future(c.legion_future_map_get_future(self.handle, domain_point.raw_value()))
+        return Future.from_cdata(
+            c.legion_future_map_get_future(self.handle, domain_point.raw_value()),
+            value_type=self.value_type)
 
 class Type(object):
-    __slots__ = ['numpy_type', 'size']
+    __slots__ = ['numpy_type', 'cffi_type', 'size']
 
-    def __init__(self, numpy_type):
+    def __init__(self, numpy_type, cffi_type):
+        assert (numpy_type is None) == (cffi_type is None)
         self.numpy_type = numpy_type
-        self.size = numpy.dtype(numpy_type).itemsize
+        self.cffi_type = cffi_type
+        self.size = numpy.dtype(numpy_type).itemsize if numpy_type is not None else 0
 
     def __reduce__(self):
-        return (Type, (self.numpy_type,))
+        return (Type, (self.numpy_type, self.cffi_type))
 
 # Pre-defined Types
-float16 = Type(numpy.float16)
-float32 = Type(numpy.float32)
-float64 = Type(numpy.float64)
-int16 = Type(numpy.int16)
-int32 = Type(numpy.int32)
-int64 = Type(numpy.int64)
-uint16 = Type(numpy.uint16)
-uint32 = Type(numpy.uint32)
-uint64 = Type(numpy.uint64)
+void = Type(None, None)
+float16 = Type(numpy.float16, 'short float')
+float32 = Type(numpy.float32, 'float')
+float64 = Type(numpy.float64, 'double')
+int8 = Type(numpy.int8, 'int8_t')
+int16 = Type(numpy.int16, 'int16_t')
+int32 = Type(numpy.int32, 'int32_t')
+int64 = Type(numpy.int64, 'int64_t')
+uint8 = Type(numpy.uint8, 'uint8_t')
+uint16 = Type(numpy.uint16, 'uint16_t')
+uint32 = Type(numpy.uint32, 'uint32_t')
+uint64 = Type(numpy.uint64, 'uint64_t')
 
 class Privilege(object):
     __slots__ = ['read', 'write', 'discard']
@@ -347,8 +415,8 @@ class Fspace(object):
         handle = c.legion_field_space_create(_my.ctx.runtime, _my.ctx.context)
         alloc = c.legion_field_allocator_create(
             _my.ctx.runtime, _my.ctx.context, handle)
-        field_ids = {}
-        field_types = {}
+        field_ids = collections.OrderedDict()
+        field_types = collections.OrderedDict()
         for field_name, field_entry in fields.items():
             try:
                 field_type, field_id = field_entry
@@ -377,6 +445,11 @@ def _Region_unpickle(tree_id, ispace, fspace):
 class Region(object):
     __slots__ = ['handle', 'ispace', 'fspace',
                  'instances', 'privileges', 'instance_wrappers']
+
+    # Make this speak the Type interface
+    numpy_type = None
+    cffi_type = 'legion_logical_region_t'
+    size = ffi.sizeof(cffi_type)
 
     def __init__(self, handle, ispace, fspace):
         # Important: Copy handle. Do NOT assume ownership.
@@ -431,9 +504,9 @@ class Region(object):
 
     def map_inline(self):
         fields_by_privilege = collections.defaultdict(set)
-        for field_name, privilege in self.privileges.iteritems():
+        for field_name, privilege in self.privileges.items():
             fields_by_privilege[privilege].add(field_name)
-        for privilege, field_names  in fields_by_privilege.iteritems():
+        for privilege, field_names  in fields_by_privilege.items():
             launcher = c.legion_inline_launcher_create_logical_region(
                 self.handle[0],
                 privilege._legion_privilege(), 0, # EXCLUSIVE
@@ -531,16 +604,50 @@ class _RegionNdarray(object):
             'strides': strides,
         }
 
-class ExternTask(object):
-    __slots__ = ['privileges', 'calling_convention', 'task_id']
+def define_regent_argument_struct(task_id, argument_types, privileges, return_type, arguments):
+    if argument_types is None:
+        raise Exception('Arguments must be typed in extern Regent tasks')
 
-    def __init__(self, task_id, privileges=None):
+    struct_name = 'task_args_%s' % task_id
+
+    n_fields = int(math.ceil(len(argument_types)/64.))
+
+    fields = ['uint64_t %s[%s];' % ('__map', n_fields)]
+    for i, arg_type in enumerate(argument_types):
+        arg_name = '__arg_%s' % i
+        fields.append('%s %s;' % (arg_type.cffi_type, arg_name))
+    for i, arg in enumerate(arguments):
+        if isinstance(arg, Region):
+            for j, field_type in enumerate(arg.fspace.field_types.values()):
+                arg_name = '__arg_%s_field_%s' % (i, j)
+                fields.append('legion_field_id_t %s;' % arg_name)
+
+    struct = 'typedef struct %s { %s } %s;' % (struct_name, ' '.join(fields), struct_name)
+    ffi.cdef(struct)
+
+    return struct_name
+
+class ExternTask(object):
+    __slots__ = ['argument_types', 'privileges', 'return_type',
+                 'calling_convention', 'task_id', '_argument_struct']
+
+    def __init__(self, task_id, argument_types=None, privileges=None,
+                 return_type=void, calling_convention=None):
+        self.argument_types = argument_types
         if privileges is not None:
             privileges = [(x if x is not None else N) for x in privileges]
         self.privileges = privileges
-        self.calling_convention = None
+        self.return_type = return_type
+        self.calling_convention = calling_convention
         assert isinstance(task_id, int)
         self.task_id = task_id
+        self._argument_struct = None
+
+    def argument_struct(self, args):
+        if self.calling_convention == 'regent' and self._argument_struct is None:
+            self._argument_struct = define_regent_argument_struct(
+                self.task_id, self.argument_types, self.privileges, self.return_type, args)
+        return self._argument_struct
 
     def __call__(self, *args):
         return self.spawn_task(*args)
@@ -553,23 +660,54 @@ class ExternTask(object):
 def extern_task(**kwargs):
     return ExternTask(**kwargs)
 
-class Task (object):
-    __slots__ = ['body', 'privileges', 'leaf', 'inner', 'idempotent', 'calling_convention', 'task_id', 'registered']
+def get_qualname(fn):
+    # Python >= 3.3 only
+    try:
+        return fn.__qualname__.split('.')
+    except AttributeError:
+        pass
 
-    def __init__(self, body, privileges=None,
-                 leaf=False, inner=False, idempotent=False,
-                 register=True, top_level=False):
+    # Python < 3.3
+    try:
+        import qualname
+        return qualname.qualname(fn).split('.')
+    except ImportError:
+        pass
+
+    # Hack: Issue error if we're wrapping a class method and failed to
+    # get the qualname
+    import inspect
+    context = [x[0].f_code.co_name for x in inspect.stack()
+               if '__module__' in x[0].f_code.co_names and
+               inspect.getmodule(x[0].f_code).__name__ != __name__]
+    if len(context) > 0:
+        raise Exception('To use a task defined in a class, please upgrade to Python >= 3.3 or install qualname (e.g. pip install qualname)')
+
+    return [fn.__name__]
+
+class Task (object):
+    __slots__ = ['body', 'privileges', 'return_type',
+                 'leaf', 'inner', 'idempotent', 'replicable',
+                 'calling_convention', 'argument_struct',
+                 'task_id', 'registered']
+
+    def __init__(self, body, privileges=None, return_type=None,
+                 leaf=False, inner=False, idempotent=False, replicable=False,
+                 register=True, task_id=None, top_level=False):
         self.body = body
         if privileges is not None:
             privileges = [(x if x is not None else N) for x in privileges]
         self.privileges = privileges
+        self.return_type = return_type
         self.leaf = bool(leaf)
         self.inner = bool(inner)
         self.idempotent = bool(idempotent)
+        self.replicable = bool(replicable)
         self.calling_convention = 'python'
+        self.argument_struct = None
         self.task_id = None
         if register:
-            self.register(top_level)
+            self.register(task_id, top_level)
 
     def __call__(self, *args):
         # Hack: This entrypoint needs to be able to handle both being
@@ -657,15 +795,18 @@ class Task (object):
         # Execute task body.
         result = self.body(*args)
 
-        # Encode result in Pickle format.
-        if result is not None:
+        # Encode result.
+        if not self.return_type:
             result_str = pickle.dumps(result, protocol=_pickle_version)
             result_size = len(result_str)
             result_ptr = ffi.new('char[]', result_size)
             ffi.buffer(result_ptr, result_size)[:] = result_str
         else:
-            result_size = 0
-            result_ptr = ffi.NULL
+            if self.return_type.size > 0:
+                result_ptr = ffi.new(ffi.getctype(self.return_type.cffi_type, '*'), result)
+            else:
+                result_ptr = ffi.NULL
+            result_size = self.return_type.size
 
         # Execute postamble.
         c.legion_task_postamble(runtime[0], context[0], result_ptr, result_size)
@@ -673,16 +814,18 @@ class Task (object):
         # Clear thread-local storage.
         del _my.ctx
 
-    def register(self, top_level_task):
+    def register(self, task_id, top_level_task):
         assert(self.task_id is None)
-        if not top_level_task:
-            global next_legion_task_id
-            task_id = next_legion_task_id 
-            next_legion_task_id += 1
-            # If we ever hit this then we need to allocate more task IDs
-            assert task_id < max_legion_task_id 
-        else:
-            task_id = 1 # Predefined value for the top-level task
+
+        if not task_id:
+            if not top_level_task:
+                global next_legion_task_id
+                task_id = next_legion_task_id
+                next_legion_task_id += 1
+                # If we ever hit this then we need to allocate more task IDs
+                assert task_id < max_legion_task_id
+            else:
+                task_id = 1 # Predefined value for the top-level task
 
         execution_constraints = c.legion_execution_constraint_set_create()
         c.legion_execution_constraint_set_add_processor_constraint(
@@ -695,10 +838,15 @@ class Task (object):
         options[0].leaf = self.leaf
         options[0].inner = self.inner
         options[0].idempotent = self.idempotent
+        options[0].replicable = self.replicable
 
-        task_name = ('%s.%s' % (self.body.__module__, self.body.__name__))
+        qualname = get_qualname(self.body)
+        task_name = ('%s.%s' % (self.body.__module__, '.'.join(qualname)))
 
-        c.legion_runtime_register_task_variant_python_source(
+        c_qualname_comps = [ffi.new('char []', comp.encode('utf-8')) for comp in qualname]
+        c_qualname = ffi.new('char *[]', c_qualname_comps)
+
+        c.legion_runtime_register_task_variant_python_source_qualname(
             c.legion_runtime_get_runtime(),
             task_id,
             task_name.encode('utf-8'),
@@ -707,7 +855,8 @@ class Task (object):
             layout_constraints,
             options[0],
             self.body.__module__.encode('utf-8'),
-            self.body.__name__.encode('utf-8'),
+            c_qualname,
+            len(qualname),
             ffi.NULL,
             0)
 
@@ -723,27 +872,53 @@ def task(body=None, **kwargs):
     return Task(body, **kwargs)
 
 class _TaskLauncher(object):
-    __slots__ = ['task_id', 'privileges', 'calling_convention']
+    __slots__ = ['task']
 
-    def __init__(self, task_id, privileges, calling_convention):
-        self.task_id = task_id
-        self.privileges = privileges
-        self.calling_convention = calling_convention
+    def __init__(self, task):
+        self.task = task
 
-    def preprocess_args(self, *args):
+    def preprocess_args(self, args):
         return [
             arg._legion_preprocess_task_argument()
             if hasattr(arg, '_legion_preprocess_task_argument') else arg
             for arg in args]
 
-    def encode_args(self, *args):
+    def gather_futures(self, args):
+        normal = []
+        futures = []
+        for arg in args:
+            if isinstance(arg, Future):
+                arg = Future(arg, argument_number=len(futures))
+                futures.append(arg)
+            normal.append(arg)
+        return normal, futures
+
+    def encode_args(self, args):
         task_args = ffi.new('legion_task_argument_t *')
         task_args_buffer = None
-        if self.calling_convention == 'python':
+        if self.task.calling_convention == 'python':
             arg_str = pickle.dumps(args, protocol=_pickle_version)
             task_args_buffer = ffi.new('char[]', arg_str)
             task_args[0].args = task_args_buffer
             task_args[0].arglen = len(arg_str)
+        elif self.task.calling_convention == 'regent':
+            arg_struct = self.task.argument_struct(args)
+            task_args_buffer = ffi.new('%s*' % arg_struct)
+            # FIXME: Correct for > 64 arguments.
+            getattr(task_args_buffer, '__map')[0] = 0 # Currently we never pass futures.
+            for i, arg in enumerate(args):
+                arg_name = '__arg_%s' % i
+                arg_value = arg
+                if hasattr(arg, 'handle'):
+                    arg_value = arg.handle[0]
+                setattr(task_args_buffer, arg_name, arg_value)
+            for i, arg in enumerate(args):
+                if isinstance(arg, Region):
+                    for j, field_id in enumerate(arg.fspace.field_ids.values()):
+                        arg_name = '__arg_%s_field_%s' % (i, j)
+                        setattr(task_args_buffer, arg_name, field_id)
+            task_args[0].args = task_args_buffer
+            task_args[0].arglen = ffi.sizeof(arg_struct)
         else:
             # FIXME: External tasks need a dedicated calling
             # convention to permit the passing of task arguments.
@@ -755,16 +930,17 @@ class _TaskLauncher(object):
     def spawn_task(self, *args):
         assert(isinstance(_my.ctx, Context))
 
-        args = self.preprocess_args(*args)
-        task_args, _ = self.encode_args(*args)
+        args = self.preprocess_args(args)
+        args, futures = self.gather_futures(args)
+        task_args, _ = self.encode_args(args)
 
         # Construct the task launcher.
         launcher = c.legion_task_launcher_create(
-            self.task_id, task_args[0], c.legion_predicate_true(), 0, 0)
+            self.task.task_id, task_args[0], c.legion_predicate_true(), 0, 0)
         for i, arg in zip(range(len(args)), args):
             if isinstance(arg, Region):
-                assert i < len(self.privileges)
-                priv = self.privileges[i]
+                assert i < len(self.task.privileges)
+                priv = self.task.privileges[i]
                 req = c.legion_task_launcher_add_region_requirement_logical_region(
                     launcher, arg.handle[0],
                     priv._legion_privilege(),
@@ -776,7 +952,9 @@ class _TaskLauncher(object):
                     if not hasattr(priv, 'fields') or name in priv.fields:
                         c.legion_task_launcher_add_field(
                             launcher, req, fid, True)
-            elif self.calling_convention is None:
+            elif isinstance(arg, Future):
+                c.legion_task_launcher_add_future(launcher, arg.handle)
+            elif self.task.calling_convention is None:
                 # FIXME: Task arguments aren't being encoded AT ALL;
                 # at least throw an exception so that the user knows
                 raise Exception('External tasks do not support non-region arguments')
@@ -787,19 +965,18 @@ class _TaskLauncher(object):
         c.legion_task_launcher_destroy(launcher)
 
         # Build future of result.
-        future = Future(result)
+        future = Future.from_cdata(result, value_type=self.task.return_type)
         c.legion_future_destroy(result)
         return future
 
 class _IndexLauncher(_TaskLauncher):
-    __slots__ = ['task_id', 'privileges', 'calling_convention',
-                 'domain', 'local_args', 'future_map']
+    __slots__ = ['task', 'domain', 'local_args', 'future_args', 'future_map']
 
-    def __init__(self, task_id, privileges, calling_convention, domain):
-        super(_IndexLauncher, self).__init__(
-            task_id, privileges, calling_convention)
+    def __init__(self, task, domain):
+        super(_IndexLauncher, self).__init__(task)
         self.domain = domain
         self.local_args = c.legion_argument_map_create()
+        self.future_args = []
         self.future_map = None
 
     def __del__(self):
@@ -810,10 +987,12 @@ class _IndexLauncher(_TaskLauncher):
 
     def attach_local_args(self, index, *args):
         point = DomainPoint(index)
-        args = self.preprocess_args(*args)
-        task_args, _ = self.encode_args(*args)
+        task_args, _ = self.encode_args(args)
         c.legion_argument_map_set_point(
             self.local_args, point.raw_value(), task_args[0], False)
+
+    def attach_future_args(self, *args):
+        self.future_args = args
 
     def launch(self):
         # All arguments are passed as local, so global is NULL.
@@ -823,9 +1002,12 @@ class _IndexLauncher(_TaskLauncher):
 
         # Construct the task launcher.
         launcher = c.legion_index_launcher_create(
-            self.task_id, self.domain.raw_value(),
+            self.task.task_id, self.domain.raw_value(),
             global_args[0], self.local_args,
             c.legion_predicate_true(), False, 0, 0)
+
+        for arg in self.future_args:
+            c.legion_index_launcher_add_future(launcher, arg.handle)
 
         # Launch the task.
         result = c.legion_index_launcher_execute(
@@ -839,10 +1021,7 @@ class _IndexLauncher(_TaskLauncher):
 class TaskLaunch(object):
     __slots__ = []
     def spawn_task(self, task, *args):
-        launcher = _TaskLauncher(
-            task_id=task.task_id,
-            privileges=task.privileges,
-            calling_convention=task.calling_convention)
+        launcher = _TaskLauncher(task=task)
         return launcher.spawn_task(*args)
 
 class _IndexValue(object):
@@ -902,20 +1081,20 @@ class IndexLaunch(object):
 
     def ensure_launcher(self, task):
         if self.launcher is None:
-            self.launcher = _IndexLauncher(
-                task_id=task.task_id,
-                privileges=task.privileges,
-                calling_convention=task.calling_convention,
-                domain=self.domain)
+            self.launcher = _IndexLauncher(task=task, domain=self.domain)
 
     def check_compatibility(self, task, *args):
         # The tasks in a launch must conform to the following constraints:
         #   * Only one task can be launched.
         #   * The arguments must be compatible:
         #       * At a given argument position, the value must always
-        #         be a region, or always not.
+        #         be a special value, or always not.
+        #       * Special values include: regions and futures.
         #       * If a region, the value must be symbolic (i.e. able
         #         to be analyzed as a function of the index expression).
+        #       * If a future, the values must be literally identical
+        #         (i.e. each argument slot in the launch can only
+        #         accept a single future value.)
 
         if self.saved_task is None:
             self.saved_task = task
@@ -928,13 +1107,18 @@ class IndexLaunch(object):
             # TODO: Add support for region arguments
             if isinstance(arg, Region) or isinstance(arg, RegionField):
                 raise Exception('TODO: Support region arguments to an IndexLaunch')
+            elif isinstance(arg, Future):
+                if arg != saved_arg:
+                    raise Exception('Future argument to IndexLaunch does not match previous value at this position')
 
     def spawn_task(self, task, *args):
         self.ensure_launcher(task)
         self.check_compatibility(task, *args)
+        args = self.launcher.preprocess_args(args)
+        args, futures = self.launcher.gather_futures(args)
         self.launcher.attach_local_args(self.point, *args)
+        self.launcher.attach_future_args(*futures)
         # TODO: attach region args
-        # TODO: attach future args
         return _FuturePoint(self.launcher, int(self.point))
 
     def launch(self):
@@ -967,7 +1151,49 @@ class Tunable(object):
     def select(tunable_id):
         result = c.legion_runtime_select_tunable_value(
             _my.ctx.runtime, _my.ctx.context, tunable_id, 0, 0)
-        future = Future(result, 'size_t')
+        future = Future.from_cdata(result, value_type=uint64)
         c.legion_future_destroy(result)
         return future
 
+def execute_as_script():
+    args = input_args(True)
+    if len(args) < 1:
+        return False, False # no idea what's going on here, just return
+    if os.path.basename(args[0]) != 'legion_python':
+        return False, False # not in legion_python
+    if len(args) < 2 or args[1].startswith('-'):
+        return True, False # argument is a flag
+    # If it has an extension, we're going to guess that it was
+    # intended to be a script.
+    return True, len(os.path.splitext(args[1])[1]) > 1
+
+is_legion_python, is_script = execute_as_script()
+if is_script:
+    # We can't use runpy for this since runpy is aggressive about
+    # cleaning up after itself and removes the module before execution
+    # has completed.
+    def run_path(filename, run_name=None):
+        import imp
+        module = imp.new_module(run_name)
+        setattr(module, '__name__', run_name)
+        setattr(module, '__file__', filename)
+        setattr(module, '__loader__', None)
+        setattr(module, '__package__', run_name.rpartition('.')[0])
+        assert run_name not in sys.modules
+        sys.modules[run_name] = module
+
+        with open(filename) as f:
+            code = compile(f.read(), filename, 'exec')
+            exec(code, module.__dict__)
+
+    @task(top_level=True, replicable=True)
+    def legion_main():
+        args = input_args(True)
+        assert len(args) >= 2
+        sys.argv = list(args)
+        run_path(args[1], run_name='__legion_main__')
+elif is_legion_python:
+    print('WARNING: Executing Python modules via legion_python has been deprecated.')
+    print('It is now recommended to run the script directly by passing the path')
+    print('to legion_python.')
+    print()

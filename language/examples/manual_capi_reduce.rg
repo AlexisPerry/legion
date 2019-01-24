@@ -83,6 +83,12 @@ terra top_level_task(task : c.legion_task_t,
     c.legion_field_allocator_destroy(fsa)
   end
 
+  do
+    var init : int = 0
+    c.legion_runtime_fill_field(runtime, ctx, r, r, f1, &init, sizeof(int), c.legion_predicate_true())
+    c.legion_runtime_fill_field(runtime, ctx, r, r, f2, &init, sizeof(int), c.legion_predicate_true())
+  end
+
   var coloring = c.legion_coloring_create()
   c.legion_coloring_add_point(coloring, 1, ptr1)
   c.legion_coloring_add_point(coloring, 2, ptr1)
@@ -130,14 +136,14 @@ terra main()
   var layout_constraints = c.legion_task_layout_constraint_set_create()
   [ tasklib.preregister_task(top_level_task) ](
     TID_TOP_LEVEL_TASK,
-    "top_level_task",
+    "top_level_task", "top_level_task",
     execution_constraints, layout_constraints,
     c.legion_task_config_options_t {
       leaf = false, inner = false, idempotent = false},
     nil, 0)
   [ tasklib.preregister_task(sub_task) ](
     TID_SUB_TASK,
-    "sub_task",
+    "sub_task", "sub_task",
     execution_constraints, layout_constraints,
     c.legion_task_config_options_t {
       leaf = false, inner = false, idempotent = false},

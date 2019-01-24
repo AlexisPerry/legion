@@ -149,10 +149,11 @@ namespace Realm {
   template <typename T, void (T::*START_MTHD)(void)>
   /*static*/ Thread *Thread::create_user_thread(T *target,
 						const ThreadLaunchParameters& params,
+						const CoreReservation *rsrv,
 						ThreadScheduler *_scheduler)
   {
     return create_user_thread_untyped(target, thread_entry_wrapper<T, START_MTHD>,
-				      params, _scheduler);
+				      params, rsrv, _scheduler);
   }
 #endif
 
@@ -320,25 +321,6 @@ namespace Realm {
     // no need for locks - only called within the thread
     Thread::self()->exception_handler_count--;
   }
-
-
-  ////////////////////////////////////////////////////////////////////////
-  //
-  // class Coroutine<YT, RT>
-#if DO_I_REALLY_WANT_COROUTINES
-  template <typename YT, typename RT>
-  inline Coroutine<YT, RT>::~Coroutine(void)
-  {
-  }
-
-  template <typename YT, typename RT>
-  inline YT Coroutine<YT, RT>::get_yield_value(void)
-  {
-    // illegal unless we're actually yielded...
-    assert(state == STATE_YIELDED);
-    return yield_value;
-  }
-#endif
 
 
   ////////////////////////////////////////////////////////////////////////

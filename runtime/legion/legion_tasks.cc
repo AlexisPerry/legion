@@ -450,6 +450,7 @@ namespace Legion {
       rez.serialize(must_epoch_task);
       rez.serialize(index_domain);
       rez.serialize(index_point);
+      rez.serialize(sharding_space);
       rez.serialize(local_arglen);
       rez.serialize(local_args,local_arglen);
       rez.serialize(orig_proc);
@@ -543,6 +544,7 @@ namespace Legion {
       derez.deserialize(must_epoch_task);
       derez.deserialize(index_domain);
       derez.deserialize(index_point);
+      derez.deserialize(sharding_space);
       derez.deserialize(local_arglen);
       if (local_arglen > 0)
       {
@@ -686,7 +688,7 @@ namespace Legion {
   
     //--------------------------------------------------------------------------
     TaskOp::TaskOp(Runtime *rt)
-      : ExternalTask(), SpeculativeOp(rt)
+      : ExternalTask(), MemoizableOp<SpeculativeOp>(rt)
     //--------------------------------------------------------------------------
     {
     }
@@ -725,7 +727,7 @@ namespace Legion {
 #ifdef DEBUG_LEGION
       assert(parent_ctx != NULL);
 #endif
-      return (parent_ctx->get_depth() + 1);
+      return parent_ctx->get_depth() + 1;
     }
 
     //--------------------------------------------------------------------------
@@ -769,6 +771,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       activate_speculative();
+      activate_memoizable();
       complete_received = false;
       commit_received = false;
       children_complete = false;
@@ -846,6 +849,7 @@ namespace Legion {
       DETAILED_PROFILER(runtime, PACK_BASE_TASK_CALL);
       // pack all the user facing data first
       pack_external_task(rez, target); 
+      pack_memoizable(rez);
       RezCheck z(rez);
 #ifdef DEBUG_LEGION
       assert(regions.size() == parent_req_indexes.size());
@@ -884,6 +888,7 @@ namespace Legion {
       DETAILED_PROFILER(runtime, UNPACK_BASE_TASK_CALL);
       // unpack all the user facing data
       unpack_external_task(derez, runtime, this); 
+      unpack_memoizable(derez);
       DerezCheck z(derez);
       parent_req_indexes.resize(regions.size());
       for (unsigned idx = 0; idx < parent_req_indexes.size(); idx++)
@@ -992,6 +997,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       initialize_speculation(ctx, track, regions.size(), dependences, p);
+      initialize_memoizable();
       parent_task = ctx->get_task(); // initialize the parent task
       // Fill in default values for all of the Task fields
       orig_proc = ctx->get_executing_processor();
@@ -1056,6 +1062,9 @@ namespace Legion {
       options.inline_task = false;
       options.stealable = false;
       options.map_locally = false;
+      options.valid_instances = true;
+      options.memoize = false;
+      options.replicate = false;
       const TaskPriority parent_priority = parent_ctx->is_priority_mutable() ?
         parent_ctx->get_current_priority() : 0;
       options.parent_priority = parent_priority;
@@ -1080,6 +1089,14 @@ namespace Legion {
                                 parent_ctx->get_unique_id(), 
                                 get_task_name(), get_unique_id())
       }
+      if (is_recording() && !runtime->is_local(target_proc))
+        REPORT_LEGION_ERROR(ERROR_PHYSICAL_TRACING_REMOTE_MAPPING,
+                            "Mapper %s remotely mapped task %s (UID %lld) "
+                            "that is being memoized, but physical tracing "
+                            "does not support remotely mapped operations "
+                            "yet. Please change your mapper to map this task "
+                            "locally.", mapper->get_mapper_name(),
+                            get_task_name(), get_unique_id())
       return options.inline_task;
     }
 
@@ -1898,6 +1915,7 @@ namespace Legion {
       this->speculated = rhs->speculated;
       this->parent_task = rhs->parent_task;
       this->map_origin = rhs->map_origin;
+      this->sharding_space = rhs->sharding_space;
       // From TaskOp
       this->atomic_locks = rhs->atomic_locks;
       this->early_mapped_regions = rhs->early_mapped_regions;
@@ -2182,6 +2200,8 @@ namespace Legion {
         // Set the current mapping index before doing anything that
         // could result in the generation of a copy
         set_current_mapping_index(*it);
+        // TODO: Implement physical tracing for premapped regions
+        PhysicalTraceInfo trace_info;
         // Passed all the error checking tests so register it
         // Always defer the users, the point tasks will do that
         // for themselves when they map their regions
@@ -2190,7 +2210,8 @@ namespace Legion {
                               completion_event, true/*defer users*/, 
                               true/*need read only reservations*/,
                               applied_conditions, chosen_instances,
-                              get_projection_info(*it)
+                              get_projection_info(*it),
+                              trace_info
 #ifdef DEBUG_LEGION
                               , get_logging_name(), unique_op_id
 #endif
@@ -2673,7 +2694,9 @@ namespace Legion {
               if (done_mapping.exists() && !done_mapping.has_triggered())
                 defer_launch_task(done_mapping);
               else
+              {
                 launch_task();
+              }
             }
           }
         }
@@ -3209,6 +3232,37 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    void SingleTask::replay_map_task_output()
+    //--------------------------------------------------------------------------
+    {
+      std::vector<Processor> procs;
+      tpl->get_mapper_output(this, selected_variant,
+          task_priority, perform_postmap, procs, physical_instances);
+
+      if (runtime->separate_runtime_instances)
+      {
+        target_processors.resize(1);
+        target_processors[0] = this->target_proc;
+      }
+      else // the common case
+        target_processors = procs;
+
+      virtual_mapped.resize(regions.size(), false);
+      for (unsigned idx = 0; idx < regions.size(); idx++)
+      {
+        InstanceSet &instances = physical_instances[idx];
+        if (IS_NO_ACCESS(regions[idx]))
+          continue;
+        if (instances.is_virtual_mapping())
+          virtual_mapped[idx] = true;
+        if (runtime->legion_spy_enabled)
+          runtime->forest->log_mapping_decision(unique_op_id, idx,
+                                                regions[idx],
+                                                instances);
+      }
+    }
+
+    //--------------------------------------------------------------------------
     void SingleTask::validate_target_processors(
                                  const std::vector<Processor> &processors) const
     //--------------------------------------------------------------------------
@@ -3258,21 +3312,25 @@ namespace Legion {
         // Might have constraints for extra region requirements
         if (it->first >= physical_instances.size())
           continue;
+        const InstanceSet &instances = physical_instances[it->first]; 
+        if (no_access_regions[it->first])
+          continue;
         LayoutConstraints *constraints = 
           runtime->find_layout_constraints(it->second);
-        const InstanceSet &instances = physical_instances[it->first]; 
+        bool all_conflicts = true;
         for (unsigned idx = 0; idx < instances.size(); idx++)
         {
           PhysicalManager *manager = instances[idx].get_manager();
-          if (manager->conflicts(constraints))
-            REPORT_LEGION_ERROR(ERROR_INVALID_MAPPER_OUTPUT,
-                          "Invalid mapper output. Mapper %s selected variant "
-                          "%ld for task %s (ID %lld). But instance selected "
-                          "for region requirement %d fails to satisfy the "
-                          "corresponding constraints.", 
-                          local_mapper->get_mapper_name(), impl->vid,
-                          get_task_name(), get_unique_id(), it->first)
+          all_conflicts = all_conflicts && manager->conflicts(constraints);
         }
+        if (all_conflicts)
+          REPORT_LEGION_ERROR(ERROR_INVALID_MAPPER_OUTPUT,
+                        "Invalid mapper output. Mapper %s selected variant "
+                        "%ld for task %s (ID %lld). But instance selected "
+                        "for region requirement %d fails to satisfy the "
+                        "corresponding constraints.", 
+                        local_mapper->get_mapper_name(), impl->vid,
+                        get_task_name(), get_unique_id(), it->first)
       }
       // Now we can test against the execution constraints
       const ExecutionConstraintSet &execution_constraints = 
@@ -3451,6 +3509,14 @@ namespace Legion {
       // Now we can convert the mapper output into our physical instances
       finalize_map_task_output(input, output, must_epoch_owner, 
                                valid_instances);
+
+      if (is_recording())
+      {
+#ifdef DEBUG_LEGION
+        assert(tpl != NULL && tpl->is_recording());
+#endif
+        tpl->record_mapper_output(this, output, physical_instances);
+      }
     }
 
     //--------------------------------------------------------------------------
@@ -3469,6 +3535,18 @@ namespace Legion {
                                           local_termination_event);
       }
 #endif
+      PhysicalTraceInfo trace_info;
+      if (is_recording())
+      {
+#ifdef DEBUG_LEGION
+        assert(tpl != NULL && tpl->is_recording());
+#endif
+        tpl->record_get_term_event(get_task_completion(), this);
+        trace_info.recording = true;
+        trace_info.op = this;
+        trace_info.tpl = tpl;
+      }
+
       // Now do the mapping call
       invoke_mapper(must_epoch_op);
       const bool multiple_requirements = (regions.size() > 1);
@@ -3505,6 +3583,7 @@ namespace Legion {
             precondition.wait();
         }
       }
+
       // After we've got our results, apply the state to the region tree
       for (unsigned idx = 0; idx < regions.size(); idx++)
       {
@@ -3531,7 +3610,8 @@ namespace Legion {
                                     !multiple_requirements/*read only locks*/,
                                     map_applied_conditions,
                                     physical_instances[idx],
-                                    get_projection_info(idx)
+                                    get_projection_info(idx),
+                                    trace_info
 #ifdef DEBUG_LEGION
                                     , get_logging_name()
                                     , unique_op_id
@@ -3547,7 +3627,9 @@ namespace Legion {
             local_termination_event, regions, virtual_mapped, 
             *const_cast<std::vector<VersionInfo>*>(get_version_infos()),
             *const_cast<std::vector<RestrictInfo>*>(get_restrict_infos()), 
-            physical_instances, map_applied_conditions);
+            physical_instances, map_applied_conditions,
+            trace_info);
+
         // Release any read-only reservations that we're holding
         if (!read_only_reservations.empty())
         {
@@ -3575,6 +3657,22 @@ namespace Legion {
       }
       if (perform_postmap)
         perform_post_mapping();
+
+      if (is_recording())
+      {
+#ifdef DEBUG_LEGION
+        assert(tpl != NULL && tpl->is_recording());
+#endif
+        std::set<ApEvent> ready_events;
+        for (unsigned idx = 0; idx < regions.size(); idx++)
+        {
+          if (!virtual_mapped[idx] && !no_access_regions[idx])
+            physical_instances[idx].update_wait_on_events(ready_events);
+        }
+        ApEvent ready_event = Runtime::merge_events(ready_events);
+        tpl->record_merge_events(ready_event, ready_events, this);
+        tpl->record_complete_replay(this, ready_event);
+      }
     }  
 
     //--------------------------------------------------------------------------
@@ -3725,6 +3823,8 @@ namespace Legion {
                                                 true/*postmapping*/);
         // No restrictions for postmappings
         RestrictInfo empty_restrict_info;
+        // TODO: Implement physical tracing for postmapped regions
+        PhysicalTraceInfo trace_info;
         // Register this with a no-event so that the instance can
         // be used as soon as it is valid from the copy to it
         runtime->forest->physical_register_only(regions[idx], 
@@ -3734,7 +3834,8 @@ namespace Legion {
                           true/*defer add users*/, 
                           true/*need read only locks*/,
                           map_applied_conditions, result, 
-                          get_projection_info(idx)
+                          get_projection_info(idx),
+                          trace_info
 #ifdef DEBUG_LEGION
                           , get_logging_name(), unique_op_id
 #endif
@@ -3778,11 +3879,13 @@ namespace Legion {
       // doing the inner task optimization
       if (!do_inner_task_optimization)
       {
+        std::set<ApEvent> ready_events;
         for (unsigned idx = 0; idx < regions.size(); idx++)
         {
           if (!virtual_mapped[idx] && !no_access_regions[idx])
-            physical_instances[idx].update_wait_on_events(wait_on_events);
+            physical_instances[idx].update_wait_on_events(ready_events);
         }
+        wait_on_events.insert(Runtime::merge_events(ready_events));
       }
       // Now add get all the other preconditions for the launch
       for (unsigned idx = 0; idx < futures.size(); idx++)
@@ -3810,8 +3913,8 @@ namespace Legion {
         if (!variant->is_leaf() || has_virtual_instances())
         {
           InnerContext *inner_ctx = new InnerContext(runtime, this, 
-              variant->is_inner(), regions, parent_req_indexes, 
-              virtual_mapped, unique_op_id);
+              get_depth(), variant->is_inner(), regions, 
+              parent_req_indexes, virtual_mapped, unique_op_id);
           if (mapper == NULL)
             mapper = runtime->find_mapper(current_proc, map_id);
           inner_ctx->configure_context(mapper, task_priority);
@@ -4023,6 +4126,29 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    void SingleTask::complete_replay(ApEvent instance_ready_event)
+    //--------------------------------------------------------------------------
+    {
+      if (!arrive_barriers.empty())
+      {
+        ApEvent done_event = get_task_completion();
+        for (std::vector<PhaseBarrier>::const_iterator it =
+             arrive_barriers.begin(); it !=
+             arrive_barriers.end(); it++)
+          Runtime::phase_barrier_arrive(*it, 1/*count*/, done_event);
+      }
+#ifdef DEBUG_LEGION
+      assert(is_leaf() && !has_virtual_instances());
+#endif
+      for (std::deque<InstanceSet>::iterator it = physical_instances.begin();
+           it != physical_instances.end(); ++it)
+        for (unsigned idx = 0; idx < it->size(); ++idx)
+          (*it)[idx].set_ready_event(instance_ready_event);
+      update_no_access_regions();
+      launch_task();
+    }
+
+    //--------------------------------------------------------------------------
     void SingleTask::add_copy_profiling_request(
                                            Realm::ProfilingRequestSet &requests)
     //--------------------------------------------------------------------------
@@ -4203,6 +4329,15 @@ namespace Legion {
                         "original index space to be sliced.",
                         mapper->get_mapper_name(), slice.domain_is.get_id(),
                         get_task_name(), get_unique_id());
+        if (is_recording() && !runtime->is_local(slice.proc))
+          REPORT_LEGION_ERROR(ERROR_PHYSICAL_TRACING_REMOTE_MAPPING,
+                              "Mapper %s remotely mapped a slice of task %s "
+                              "(UID %lld) that is being memoized, but physical "
+                              "tracing does not support remotely mapped "
+                              "operations yet. Please change your mapper to "
+                              "map this slice locally.",
+                              mapper->get_mapper_name(),
+                              get_task_name(), get_unique_id())
 #ifdef DEBUG_LEGION
         // Check to make sure the domain is not empty
         Domain &d = slice.domain;
@@ -4696,6 +4831,8 @@ namespace Legion {
       map_id = launcher.map_id;
       tag = launcher.tag;
       index_point = launcher.point;
+      index_domain = Domain(index_point, index_point);
+      sharding_space = launcher.sharding_space;
       is_index_space = false;
       initialize_base_task(ctx, track, launcher.static_dependences,
                            launcher.predicate, task_id);
@@ -4831,6 +4968,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
+      assert(memo_state != MEMO_REQ);
       assert(privilege_paths.size() == regions.size());
 #endif
       // If we have a trace we do our alias analysis now
@@ -4850,24 +4988,9 @@ namespace Legion {
         assert(it->impl != NULL);
 #endif
         it->impl->register_dependence(this);
-#ifdef LEGION_SPY
-        if (it->impl->producer_op != NULL)
-          LegionSpy::log_mapping_dependence(
-              parent_ctx->get_unique_id(), it->impl->producer_uid, 0,
-              get_unique_id(), 0, TRUE_DEPENDENCE);
-#endif
       }
       if (predicate_false_future.impl != NULL)
-      {
         predicate_false_future.impl->register_dependence(this);
-#ifdef LEGION_SPY
-        if (predicate_false_future.impl->producer_op != NULL)
-          LegionSpy::log_mapping_dependence(
-              parent_ctx->get_unique_id(), 
-              predicate_false_future.impl->producer_uid, 0,
-              get_unique_id(), 0, TRUE_DEPENDENCE);
-#endif
-      }
       // Also have to register any dependences on our predicate
       register_predicate_dependence();
       restrict_infos.resize(regions.size());
@@ -4913,6 +5036,9 @@ namespace Legion {
     RtEvent IndividualTask::perform_versioning_analysis(void)
     //--------------------------------------------------------------------------
     {
+      if (is_replaying())
+        return RtEvent::NO_RT_EVENT;
+
 #ifdef DEBUG_LEGION
       assert(regions.size() == version_infos.size());
 #endif
@@ -5092,8 +5218,13 @@ namespace Legion {
       stealable = false;
       // Also flush out physical regions
       for (unsigned idx = 0; idx < version_infos.size(); idx++)
+      {
         if (!virtual_mapped[idx] && !no_access_regions[idx])
           version_infos[idx].apply_mapping(map_applied_conditions);
+#ifdef DEBUG_LEGION
+        dump_physical_state(&regions[idx], idx);
+#endif
+      }
       // We can now apply any arrives or releases
       if (!arrive_barriers.empty() || !grants.empty())
       {
@@ -5701,7 +5832,23 @@ namespace Legion {
     {
       trigger_children_committed();
     }
-    
+
+    //--------------------------------------------------------------------------
+    void IndividualTask::replay_analysis(void)
+    //--------------------------------------------------------------------------
+    {
+#ifdef LEGION_SPY
+      LegionSpy::log_replay_operation(unique_op_id);
+#endif
+      if (runtime->legion_spy_enabled)
+      {
+        for (unsigned idx = 0; idx < regions.size(); idx++)
+          TaskOp::log_requirement(unique_op_id, idx, regions[idx]);
+      }
+      tpl->register_operation(this);
+      complete_mapping();
+    }
+
     //--------------------------------------------------------------------------
     /*static*/ void IndividualTask::process_unpack_remote_mapped(
                                                             Deserializer &derez)
@@ -5813,6 +5960,8 @@ namespace Legion {
     void PointTask::perform_versioning_analysis(std::set<RtEvent> &ready_events)
     //--------------------------------------------------------------------------
     {
+      if (is_replaying())
+        return;
 #ifdef DEBUG_LEGION
       assert(version_infos.empty());
 #endif
@@ -6047,8 +6196,13 @@ namespace Legion {
       map_all_regions(point_termination, must_epoch_owner);
       // Flush out the state for any mapped region requirements
       for (unsigned idx = 0; idx < version_infos.size(); idx++)
+      {
         if (!virtual_mapped[idx] && !no_access_regions[idx])
           version_infos[idx].apply_mapping(map_applied_conditions);
+#ifdef DEBUG_LEGION
+        dump_physical_state(&regions[idx], idx);
+#endif
+      }
       // If we succeeded in mapping and had no virtual mappings
       // then we are done mapping
       if (is_leaf() && !has_virtual_instances()) 
@@ -6454,6 +6608,24 @@ namespace Legion {
         execution_context->send_back_created_state(target);
     } 
 
+    //--------------------------------------------------------------------------
+    void PointTask::replay_analysis(void)
+    //--------------------------------------------------------------------------
+    {
+#ifdef LEGION_SPY
+      LegionSpy::log_replay_operation(unique_op_id);
+#endif
+      tpl->register_operation(this);
+      complete_mapping();
+    }
+
+    //--------------------------------------------------------------------------
+    TraceLocalID PointTask::get_trace_local_id() const
+    //--------------------------------------------------------------------------
+    {
+      return TraceLocalID(trace_local_id, get_domain_point());
+    }
+
     /////////////////////////////////////////////////////////////
     // Index Task 
     /////////////////////////////////////////////////////////////
@@ -6578,6 +6750,7 @@ namespace Legion {
       else
         index_domain = launcher.launch_domain;
       internal_space = launch_space;
+      sharding_space = launcher.sharding_space;
       need_intra_task_alias_analysis = !launcher.independent_requirements;
       initialize_base_task(ctx, track, launcher.static_dependences,
                            launcher.predicate, task_id);
@@ -6652,6 +6825,7 @@ namespace Legion {
       else
         index_domain = launcher.launch_domain;
       internal_space = launch_space;
+      sharding_space = launcher.sharding_space;
       need_intra_task_alias_analysis = !launcher.independent_requirements;
       redop = redop_id;
       reduction_op = Runtime::get_reduction_op(redop);
@@ -6804,6 +6978,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
+      assert(memo_state != MEMO_REQ);
       assert(privilege_paths.size() == regions.size());
 #endif 
       if (need_intra_task_alias_analysis)
@@ -6823,24 +6998,9 @@ namespace Legion {
         assert(it->impl != NULL);
 #endif
         it->impl->register_dependence(this);
-#ifdef LEGION_SPY
-        if (it->impl->producer_op != NULL)
-          LegionSpy::log_mapping_dependence(
-              parent_ctx->get_unique_id(), it->impl->producer_uid, 0,
-              get_unique_id(), 0, TRUE_DEPENDENCE);
-#endif
       }
       if (predicate_false_future.impl != NULL)
-      {
         predicate_false_future.impl->register_dependence(this);
-#ifdef LEGION_SPY
-        if (predicate_false_future.impl->producer_op != NULL)
-          LegionSpy::log_mapping_dependence(
-              parent_ctx->get_unique_id(), 
-              predicate_false_future.impl->producer_uid, 0,
-              get_unique_id(), 0, TRUE_DEPENDENCE);
-#endif
-      }
       // Also have to register any dependences on our predicate
       register_predicate_dependence();
       version_infos.resize(regions.size());
@@ -7312,6 +7472,9 @@ namespace Legion {
       result->denominator = scale_denominator;
       result->index_owner = this;
       result->remote_owner_uid = parent_ctx->get_unique_id();
+      result->trace_local_id = trace_local_id;
+      result->tpl = tpl;
+      result->memo_state = memo_state;
       if (runtime->legion_spy_enabled)
         LegionSpy::log_index_slice(get_unique_id(), 
                                    result->get_unique_id());
@@ -7576,6 +7739,31 @@ namespace Legion {
       size_t points;
       derez.deserialize(points);
       return_slice_commit(points);
+    }
+
+    //--------------------------------------------------------------------------
+    void IndexTask::replay_analysis(void)
+    //--------------------------------------------------------------------------
+    {
+#ifdef DEBUG_LEGION
+      assert(is_replaying());
+      assert(current_proc.exists());
+#endif
+#ifdef LEGION_SPY
+      LegionSpy::log_replay_operation(unique_op_id);
+#endif
+      if (runtime->legion_spy_enabled)
+      {
+        for (unsigned idx = 0; idx < regions.size(); idx++)
+          TaskOp::log_requirement(unique_op_id, idx, regions[idx]);
+      }
+      SliceTask *new_slice = this->clone_as_slice_task(internal_space,
+                                                       current_proc,
+                                                       false,
+                                                       false, 1LL);
+      slices.push_back(new_slice);
+      new_slice->enumerate_points();
+      new_slice->replay_analysis();
     }
 
     //--------------------------------------------------------------------------
@@ -7844,6 +8032,11 @@ namespace Legion {
     RtEvent SliceTask::perform_versioning_analysis(void)
     //--------------------------------------------------------------------------
     {
+      if (is_replaying())
+      {
+        need_versioning_analysis = false;
+        return RtEvent::NO_RT_EVENT;
+      }
 #ifdef DEBUG_LEGION
       assert(!points.empty());
       assert(need_versioning_analysis);
@@ -8261,6 +8454,9 @@ namespace Legion {
       result->denominator = this->denominator * scale_denominator;
       result->index_owner = this->index_owner;
       result->remote_owner_uid = this->remote_owner_uid;
+      result->trace_local_id = trace_local_id;
+      result->tpl = tpl;
+      result->memo_state = memo_state;
       if (runtime->legion_spy_enabled)
         LegionSpy::log_slice_slice(get_unique_id(), 
                                    result->get_unique_id());
@@ -8340,6 +8536,9 @@ namespace Legion {
       result->is_index_space = true;
       result->must_epoch_task = this->must_epoch_task;
       result->index_domain = this->index_domain;
+      result->trace_local_id = trace_local_id;
+      result->tpl = tpl;
+      result->memo_state = memo_state;
       // Now figure out our local point information
       result->initialize_point(this, point, point_arguments);
       if (runtime->legion_spy_enabled)
@@ -8889,6 +9088,18 @@ namespace Legion {
       for (std::set<IndexPartition>::const_iterator it = parts.begin();
             it != parts.end(); it++)
         deleted_index_partitions.insert(*it);
+    }
+
+    //--------------------------------------------------------------------------
+    void SliceTask::replay_analysis(void)
+    //--------------------------------------------------------------------------
+    {
+      for (unsigned idx = 0; idx < points.size(); idx++)
+      {
+        PointTask *point = points[idx];
+        point->replay_analysis();
+        record_child_mapped(RtEvent::NO_RT_EVENT, ApEvent::NO_AP_EVENT);
+      }
     }
 
   }; // namespace Internal 

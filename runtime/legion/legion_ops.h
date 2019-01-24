@@ -69,6 +69,9 @@ namespace Legion {
         TIMING_OP_KIND,
         TRACE_CAPTURE_OP_KIND,
         TRACE_COMPLETE_OP_KIND,
+        TRACE_REPLAY_OP_KIND,
+        TRACE_BEGIN_OP_KIND,
+        TRACE_SUMMARY_OP_KIND,
         TASK_OP_KIND,
         LAST_OP_KIND,
       };
@@ -102,6 +105,9 @@ namespace Legion {
         "Timing",                   \
         "Trace Capture",            \
         "Trace Complete",           \
+        "Trace Replay",             \
+        "Trace Begin",              \
+        "Trace Summary",            \
         "Task",                     \
       }
     public:
@@ -242,6 +248,7 @@ namespace Legion {
       virtual OpKind get_operation_kind(void) const = 0;
       virtual size_t get_region_count(void) const;
       virtual Mappable* get_mappable(void);
+      virtual Memoizable* get_memoizable(void) { return NULL; }
     protected:
       // Base call
       void activate_operation(void);
@@ -256,8 +263,11 @@ namespace Legion {
         { return execution_fence_event; }
       inline bool has_execution_fence_event(void) const 
         { return execution_fence_event.exists(); }
+      inline void set_execution_fence_event(ApEvent fence_event)
+        { execution_fence_event = fence_event; }
       inline TaskContext* get_context(void) const { return parent_ctx; }
       inline UniqueID get_unique_op_id(void) const { return unique_op_id; } 
+      virtual bool is_memoizing(void) const { return false; }
       inline bool is_tracing(void) const { return tracing; }
       inline bool is_tracking_parent(void) const { return track_parent; } 
       inline bool already_traced(void) const 
@@ -282,6 +292,7 @@ namespace Legion {
                                    LogicalPartition start_node);
       void set_trace(LegionTrace *trace, bool is_tracing,
                      const std::vector<StaticDependence> *dependences);
+      void set_trace_local_id(unsigned id);
       void set_must_epoch(MustEpochOp *epoch, bool do_registration);
     public:
       // Localize a region requirement to its parent context
@@ -542,6 +553,12 @@ namespace Legion {
                                       const UniqueID logical_context_uid,
                                       VersionInfo &version_info,
                                       std::set<RtEvent> &ready_events);
+#ifdef DEBUG_LEGION
+    protected:
+      virtual void dump_physical_state(RegionRequirement *req, unsigned idx,
+                                       bool before = false,
+                                       bool closing = false);
+#endif
     public:
       Runtime *const runtime;
     protected:
@@ -611,6 +628,8 @@ namespace Legion {
       LegionTrace *trace;
       // Track whether we are tracing this operation
       bool tracing;
+      // The id local to a trace
+      unsigned trace_local_id;
       // Our must epoch if we have one
       MustEpochOp *must_epoch;
       // A set list or recorded dependences during logical traversal
@@ -738,6 +757,58 @@ namespace Legion {
     };
 
     /**
+     * \class MemoizableOp
+     * A memoizable operation is an abstract class
+     * that serves as the basis for operation whose
+     * physical analysis can be memoized.  Memoizable
+     * operations go through an extra step in the mapper
+     * to determine whether to memoize their physical analysis.
+     */
+    template<typename OP>
+    class MemoizableOp : public OP, public Memoizable
+    {
+    public:
+      enum MemoizableState {
+        NO_MEMO,   // The operation is not subject to memoization
+        MEMO_REQ,  // The mapper requested memoization on this operation
+        RECORD,    // The runtime is recording analysis for this operation
+        REPLAY,    // The runtime is replaying analysis for this opeartion
+      };
+    public:
+      MemoizableOp(Runtime *rt);
+      void initialize_memoizable(void);
+      virtual Memoizable* get_memoizable(void) { return this; }
+    protected:
+      void pack_memoizable(Serializer &rez);
+      void unpack_memoizable(Deserializer &derez);
+    protected:
+      void activate_memoizable(void);
+    public:
+      virtual void execute_dependence_analysis(void);
+      virtual void replay_analysis(void) = 0;
+    public:
+      // From Memoizable
+      virtual TraceLocalID get_trace_local_id() const;
+      virtual ApEvent compute_sync_precondition(void) const
+        { assert(false); return ApEvent::NO_AP_EVENT; }
+      virtual void complete_replay(ApEvent complete_event)
+        { assert(false); }
+    protected:
+      void invoke_memoize_operation(MapperID mapper_id);
+      void set_memoize(bool memoize);
+    public:
+      virtual bool is_memoizing(void) const { return memo_state != NO_MEMO; }
+      bool is_replaying(void) const { return memo_state == REPLAY; }
+      bool is_recording(void) const { return memo_state == RECORD; }
+    protected:
+      // The physical trace for this operation if any
+      PhysicalTemplate *tpl;
+      // Track whether we are memoizing physical analysis for this operation
+      MemoizableState memo_state;
+      bool need_prepipeline_stage;
+    };
+
+    /**
      * \class MapOp
      * Mapping operations are used for computing inline mapping
      * operations.  Mapping operations will always update a
@@ -836,7 +907,7 @@ namespace Legion {
      * from different region trees in an efficient way by
      * using the low-level runtime copy facilities. 
      */
-    class CopyOp : public Copy, public SpeculativeOp,
+    class CopyOp : public Copy, public MemoizableOp<SpeculativeOp>,
                    public LegionHeapify<CopyOp> {
     public:
       static const AllocationType alloc_type = COPY_OP_ALLOC;
@@ -861,7 +932,8 @@ namespace Legion {
       virtual size_t get_region_count(void) const;
       virtual Mappable* get_mappable(void);
     public:
-      virtual bool has_prepipeline_stage(void) const { return true; }
+      virtual bool has_prepipeline_stage(void) const
+        { return need_prepipeline_stage; }
       virtual void trigger_prepipeline_stage(void);
       virtual void trigger_dependence_analysis(void);
       virtual void trigger_ready(void);
@@ -889,18 +961,25 @@ namespace Legion {
       virtual UniqueID get_unique_id(void) const;
       virtual unsigned get_context_index(void) const;
       virtual int get_depth(void) const;
-      virtual const ProjectionInfo* get_projection_info(unsigned idx, bool src);
+      virtual const ProjectionInfo* get_projection_info(unsigned idx);
     protected:
-      void check_copy_privilege(const RegionRequirement &req, 
-                                unsigned idx, bool src,
+      void check_copy_privilege(const RegionRequirement &req, unsigned idx,
                                 bool permit_projection = false);
       void compute_parent_indexes(void);
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
+    public:
+      // From Memoizable
+      virtual ApEvent compute_sync_precondition(void) const;
+      virtual void complete_replay(ApEvent copy_complete_event);
+    protected:
       template<bool IS_SRC>
       int perform_conversion(unsigned idx, const RegionRequirement &req,
                              std::vector<MappingInstance> &output,
                              InstanceSet &targets, bool is_reduce = false);
-      inline void set_mapping_state(unsigned idx, bool is_src) 
-        { current_index = idx; current_src = is_src; }
+      inline void set_mapping_state(unsigned idx) 
+        { current_index = idx; }
       virtual void add_copy_profiling_request(
                                       Realm::ProfilingRequestSet &reqeusts);
       virtual void handle_profiling_response(
@@ -914,10 +993,18 @@ namespace Legion {
       std::vector<VersionInfo>    dst_versions;
       std::vector<RestrictInfo>   src_restrict_infos;
       std::vector<RestrictInfo>   dst_restrict_infos;
+    public: // These are only used for indirect copies
+      std::vector<RegionTreePath> gather_privilege_paths;
+      std::vector<RegionTreePath> scatter_privilege_paths;
+      std::vector<unsigned>       gather_parent_indexes;
+      std::vector<unsigned>       scatter_parent_indexes;
+      std::vector<VersionInfo>    gather_versions;
+      std::vector<VersionInfo>    scatter_versions;
+      std::vector<RestrictInfo>   gather_restrict_infos;
+      std::vector<RestrictInfo>   scatter_restrict_infos;
     protected: // for support with mapping
       MapperManager*              mapper;
       unsigned                    current_index;
-      bool                        current_src;
     protected:
       std::map<PhysicalManager*,std::pair<unsigned,bool> > acquired_instances;
       std::vector<std::map<Reservation,bool> > atomic_locks;
@@ -966,12 +1053,14 @@ namespace Legion {
       void check_point_requirements(void);
 #endif
     public:
-      virtual const ProjectionInfo* get_projection_info(unsigned idx, bool src);
+      virtual const ProjectionInfo* get_projection_info(unsigned idx);
     public:
       IndexSpace                    launch_space;
     public:
       std::vector<ProjectionInfo>   src_projection_infos;
       std::vector<ProjectionInfo>   dst_projection_infos;
+      std::vector<ProjectionInfo>   gather_projection_infos;
+      std::vector<ProjectionInfo>   scatter_projection_infos;
     protected:
       std::vector<PointCopyOp*>     points;
       unsigned                      points_committed;
@@ -1016,7 +1105,7 @@ namespace Legion {
       virtual const DomainPoint& get_domain_point(void) const;
       virtual void set_projection_result(unsigned idx,LogicalRegion result);
     public:
-      virtual const ProjectionInfo* get_projection_info(unsigned idx, bool src);
+      virtual const ProjectionInfo* get_projection_info(unsigned idx);
     protected:
       IndexCopyOp*              owner;
     };
@@ -1057,6 +1146,9 @@ namespace Legion {
       virtual void trigger_dependence_analysis(void);
       virtual void trigger_mapping(void);
     protected:
+      void perform_fence_analysis(bool update_fence = false);
+      void update_current_fence(void);
+    protected:
       FenceKind fence_kind;
       ApEvent execution_precondition;
     };
@@ -1088,7 +1180,7 @@ namespace Legion {
       virtual OpKind get_operation_kind(void) const;
     public:
       virtual void trigger_mapping(void);
-      virtual void deferred_execute(void);
+      virtual void deferred_execute(void); 
     protected:
       ApEvent previous_completion;
     };
@@ -1171,7 +1263,7 @@ namespace Legion {
       virtual ~InternalOp(void);
     public:
       void initialize_internal(Operation *creator, int creator_req_idx,
-                               const TraceInfo &trace_info);
+                               const LogicalTraceInfo &trace_info);
       void activate_internal(void);
       void deactivate_internal(void);
     public:
@@ -1215,7 +1307,8 @@ namespace Legion {
       OpenOp& operator=(const OpenOp &rhs);
     public:
       void initialize(const FieldMask &open_mask, RegionTreeNode *start, 
-                      const RegionTreePath &path, const TraceInfo &trace_info,
+                      const RegionTreePath &path, 
+                      const LogicalTraceInfo &trace_info,
                       Operation *creator, int req_idx);
     public:
       virtual void activate(void);
@@ -1249,7 +1342,7 @@ namespace Legion {
       AdvanceOp& operator=(const AdvanceOp &rhs);
     public:
       void initialize(RegionTreeNode *parent, const FieldMask &advance,
-                      const TraceInfo &trace_info, Operation *creator, 
+                      const LogicalTraceInfo &trace_info, Operation *creator, 
                       int req_idx, bool parent_is_upper_bound);
       void set_child_node(RegionTreeNode *child);
       void set_split_child_mask(const FieldMask &split_mask);
@@ -1303,7 +1396,7 @@ namespace Legion {
       void initialize_close(Operation *creator, unsigned idx,
                             unsigned parent_req_index,
                             const RegionRequirement &req,
-                            const TraceInfo &trace_info);
+                            const LogicalTraceInfo &trace_info);
       void perform_logging(void);
     public:
       virtual void activate(void) = 0;
@@ -1356,7 +1449,8 @@ namespace Legion {
       InterCloseOp& operator=(const InterCloseOp &rhs);
     public:
       void initialize(TaskContext *ctx, const RegionRequirement &req,
-                      ClosedNode *closed_tree, const TraceInfo &trace_info,
+                      ClosedNode *closed_tree, 
+                      const LogicalTraceInfo &trace_info,
                       int close_idx, const VersionInfo &version_info,
                       const FieldMask &close_mask, Operation *create_op);
       ProjectionInfo& initialize_disjoint_close(const FieldMask &disjoint_mask,
@@ -1436,7 +1530,7 @@ namespace Legion {
       ReadCloseOp& operator=(const ReadCloseOp &rhs);
     public:
       void initialize(TaskContext *ctx, const RegionRequirement &req,
-                      const TraceInfo &trace_info, int close_idx,
+                      const LogicalTraceInfo &trace_info, int close_idx,
                       const FieldMask &close_mask, Operation *create_op);
     public:
       virtual void activate(void);
@@ -1542,7 +1636,7 @@ namespace Legion {
      * user-level software coherence when tasks own
      * regions with simultaneous coherence.
      */
-    class AcquireOp : public Acquire, public SpeculativeOp,
+    class AcquireOp : public Acquire, public MemoizableOp<SpeculativeOp>,
                       public LegionHeapify<AcquireOp> {
     public:
       static const AllocationType alloc_type = ACQUIRE_OP_ALLOC;
@@ -1585,6 +1679,13 @@ namespace Legion {
       virtual int get_depth(void) const;
     public:
       const RegionRequirement& get_requirement(void) const;
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
+    public:
+      // From Memoizable
+      virtual ApEvent compute_sync_precondition(void) const;
+      virtual void complete_replay(ApEvent acquire_complete_event);
     protected:
       void check_acquire_privilege(void);
       void compute_parent_index(void);
@@ -1616,7 +1717,7 @@ namespace Legion {
      * user-level software coherence when tasks own
      * regions with simultaneous coherence.
      */
-    class ReleaseOp : public Release, public SpeculativeOp,
+    class ReleaseOp : public Release, public MemoizableOp<SpeculativeOp>,
                       public LegionHeapify<ReleaseOp> {
     public:
       static const AllocationType alloc_type = RELEASE_OP_ALLOC;
@@ -1664,6 +1765,13 @@ namespace Legion {
       virtual int get_depth(void) const;
     public:
       const RegionRequirement& get_requirement(void) const;
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
+    public:
+      // From Memoizable
+      virtual ApEvent compute_sync_precondition(void) const;
+      virtual void complete_replay(ApEvent release_complete_event);
     protected:
       void check_release_privilege(void);
       void compute_parent_index(void);
@@ -1696,7 +1804,8 @@ namespace Legion {
      * us the framework necessary to handle roll backs on 
      * collectives so we can memoize their results.
      */
-    class DynamicCollectiveOp : public Operation,
+    class DynamicCollectiveOp : public Mappable,
+                                public MemoizableOp<Operation>,
                                 public LegionHeapify<DynamicCollectiveOp> {
     public:
       static const AllocationType alloc_type = DYNAMIC_COLLECTIVE_OP_ALLOC;
@@ -1708,6 +1817,27 @@ namespace Legion {
       DynamicCollectiveOp& operator=(const DynamicCollectiveOp &rhs);
     public:
       Future initialize(TaskContext *ctx, const DynamicCollective &dc);
+    public:
+      // From Mappable
+      virtual UniqueID get_unique_id(void) const { return unique_op_id; }
+      virtual unsigned get_context_index(void) const;
+      virtual int get_depth(void) const;
+      virtual MappableType get_mappable_type(void) const
+        { return DYNAMIC_COLLECTIVE_MAPPABLE; }
+      virtual const Task* as_task(void) const { return NULL; }
+      virtual const Copy* as_copy(void) const { return NULL; }
+      virtual const InlineMapping* as_inline(void) const { return NULL; }
+      virtual const Acquire* as_acquire(void) const { return NULL; }
+      virtual const Release* as_release(void) const { return NULL; }
+      virtual const Close* as_close(void) const { return NULL; }
+      virtual const Fill* as_fill(void) const { return NULL; }
+      virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return &collective; }
+      virtual const MustEpoch* as_must_epoch(void) const { return NULL; }
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
     public:
       virtual void activate(void);
       virtual void deactivate(void);
@@ -2569,7 +2699,7 @@ namespace Legion {
      * Fill operations are used to initialize a field to a
      * specific value for a particular logical region.
      */
-    class FillOp : public SpeculativeOp, public Fill,
+    class FillOp : public MemoizableOp<SpeculativeOp>, public Fill,
                    public LegionHeapify<FillOp> {
     public:
       static const AllocationType alloc_type = FILL_OP_ALLOC;
@@ -2597,7 +2727,8 @@ namespace Legion {
       virtual unsigned get_context_index(void) const;
       virtual int get_depth(void) const;
     public:
-      virtual bool has_prepipeline_stage(void) const { return true; }
+      virtual bool has_prepipeline_stage(void) const
+        { return need_prepipeline_stage; }
       virtual void trigger_prepipeline_stage(void);
       virtual void trigger_dependence_analysis(void);
       virtual void trigger_ready(void);
@@ -2617,6 +2748,9 @@ namespace Legion {
       void compute_parent_index(void);
       ApEvent compute_sync_precondition(void) const;
       void log_fill_requirement(void) const;
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
     public:
       RegionTreePath privilege_path;
       VersionInfo version_info;
@@ -2839,5 +2973,7 @@ namespace Legion {
 
   }; //namespace Internal 
 }; // namespace Legion 
+
+#include "legion_ops.inl"
 
 #endif // __LEGION_OPERATIONS_H__

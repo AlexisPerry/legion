@@ -43,6 +43,7 @@ list(APPEND REALM_SRC
   realm/deppart/setops.h                   realm/deppart/setops.cc
   realm/deppart/sparsity_impl.h            realm/deppart/sparsity_impl.cc
   realm/deppart/sparsity_impl.inl
+  realm/atomics.h           realm/atomics.inl
   realm/event_impl.h        realm/event_impl.cc
   realm/event_impl.inl
   realm/faults.h            realm/faults.cc
@@ -198,7 +199,7 @@ if(Legion_USE_Python)
   target_compile_definitions(RealmRuntime PRIVATE REALM_PYTHON_VERSION_MAJOR=${PYTHON_VERSION_MAJOR})
 endif()
 
-set_target_properties(RealmRuntime PROPERTIES OUTPUT_NAME realm)
+set_target_properties(RealmRuntime PROPERTIES OUTPUT_NAME "realm${INSTALL_SUFFIX}")
 
 target_include_directories(RealmRuntime
   INTERFACE
@@ -269,7 +270,7 @@ list(APPEND LEGION_SRC
 add_library(LegionRuntime ${MAPPER_SRC} ${LEGION_SRC})
 target_link_libraries(LegionRuntime RealmRuntime)
 set_target_properties(LegionRuntime PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(LegionRuntime PROPERTIES OUTPUT_NAME legion)
+set_target_properties(LegionRuntime PROPERTIES OUTPUT_NAME "legion${INSTALL_SUFFIX}")
 set_target_properties(LegionRuntime PROPERTIES SOVERSION ${SOVERSION})
 target_compile_definitions(LegionRuntime PUBLIC LEGION_USE_CMAKE)
 

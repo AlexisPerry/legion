@@ -47,6 +47,9 @@ extern "C" {
   NEW_OPAQUE_TYPE(legion_runtime_t);
   NEW_OPAQUE_TYPE(legion_context_t);
   NEW_OPAQUE_TYPE(legion_domain_point_iterator_t);
+  NEW_OPAQUE_TYPE(legion_rect_in_domain_iterator_1d_t);
+  NEW_OPAQUE_TYPE(legion_rect_in_domain_iterator_2d_t);
+  NEW_OPAQUE_TYPE(legion_rect_in_domain_iterator_3d_t);
   NEW_OPAQUE_TYPE(legion_coloring_t);
   NEW_OPAQUE_TYPE(legion_domain_coloring_t);
   NEW_OPAQUE_TYPE(legion_point_coloring_t);
@@ -58,6 +61,9 @@ extern "C" {
   NEW_OPAQUE_TYPE(legion_predicate_t);
   NEW_OPAQUE_TYPE(legion_future_t);
   NEW_OPAQUE_TYPE(legion_future_map_t);
+  NEW_OPAQUE_TYPE(legion_deferred_buffer_char_1d_t);
+  NEW_OPAQUE_TYPE(legion_deferred_buffer_char_2d_t);
+  NEW_OPAQUE_TYPE(legion_deferred_buffer_char_3d_t);
   NEW_OPAQUE_TYPE(legion_task_launcher_t);
   NEW_OPAQUE_TYPE(legion_index_launcher_t);
   NEW_OPAQUE_TYPE(legion_inline_launcher_t);
@@ -278,6 +284,7 @@ extern "C" {
     bool leaf /* = false */;
     bool inner /* = false */;
     bool idempotent /* = false */;
+    bool replicable /* = false */;
   }  legion_task_config_options_t;
 
   /**
@@ -335,6 +342,9 @@ extern "C" {
     bool inline_task;
     bool stealable;
     bool map_locally;
+    bool valid_instances;
+    bool memoize;
+    bool replicate;
     legion_task_priority_t parent_priority;
   } legion_task_options_t;
 
@@ -365,7 +375,29 @@ extern "C" {
   typedef
     legion_logical_region_t (*legion_projection_functor_logical_region_t)(
       legion_runtime_t /* runtime */,
-      const legion_mappable_t /* mappable */,
+      legion_logical_region_t /* upper_bound */,
+      legion_domain_point_t /* point */,
+      legion_domain_t /* launch domain */);
+
+  /**
+   * Interface for a Legion C projection functor (Logical Partition
+   * upper bound).
+   */
+  typedef
+    legion_logical_region_t (*legion_projection_functor_logical_partition_t)(
+      legion_runtime_t /* runtime */,
+      legion_logical_partition_t /* upper_bound */,
+      legion_domain_point_t /* point */,
+      legion_domain_t /* launch domain */);
+
+  /**
+   * Interface for a Legion C projection functor (Logical Region
+   * upper bound).
+   */
+  typedef
+    legion_logical_region_t (*legion_projection_functor_logical_region_mappable_t)(
+      legion_runtime_t /* runtime */,
+      legion_mappable_t /* mappable */,
       unsigned /* index */,
       legion_logical_region_t /* upper_bound */,
       legion_domain_point_t /* point */);
@@ -375,9 +407,9 @@ extern "C" {
    * upper bound).
    */
   typedef
-    legion_logical_region_t (*legion_projection_functor_logical_partition_t)(
+    legion_logical_region_t (*legion_projection_functor_logical_partition_mappable_t)(
       legion_runtime_t /* runtime */,
-      const legion_mappable_t /* mappable */,
+      legion_mappable_t /* mappable */,
       unsigned /* index */,
       legion_logical_partition_t /* upper_bound */,
       legion_domain_point_t /* point */);
@@ -469,6 +501,12 @@ extern "C" {
 
   legion_rect_3d_t
   legion_domain_get_bounds_3d(legion_domain_t d);
+
+  /**
+   * @see Legion::Domain::contains()
+   */
+  bool
+  legion_domain_contains(legion_domain_t d, legion_domain_point_t p);
 
   /**
    * @see Legion::Domain::get_volume()
@@ -627,6 +665,79 @@ extern "C" {
    */
   legion_domain_point_t
   legion_domain_point_iterator_next(legion_domain_point_iterator_t handle);
+
+  // -----------------------------------------------------------------------
+  // Rect in Domain Iterator
+  // -----------------------------------------------------------------------
+
+  /**
+   * @return Caller takes ownership of return value.
+   *
+   * @see Legion::Domain::RectInDomainIterator::RectInDomainIterator()
+   */
+  legion_rect_in_domain_iterator_1d_t
+  legion_rect_in_domain_iterator_create_1d(legion_domain_t handle);
+
+  legion_rect_in_domain_iterator_2d_t
+  legion_rect_in_domain_iterator_create_2d(legion_domain_t handle);
+
+  legion_rect_in_domain_iterator_3d_t
+  legion_rect_in_domain_iterator_create_3d(legion_domain_t handle);
+
+  /**
+   * @param handle Caller must have ownership of parameter `handle`.
+   *
+   * @see Legion::Domain::RectInDomainIterator::~RectInDomainIterator()
+   */
+  void
+  legion_rect_in_domain_iterator_destroy_1d(
+                                    legion_rect_in_domain_iterator_1d_t handle);
+  void
+  legion_rect_in_domain_iterator_destroy_2d(
+                                    legion_rect_in_domain_iterator_2d_t handle);
+  void
+  legion_rect_in_domain_iterator_destroy_3d(
+                                    legion_rect_in_domain_iterator_3d_t handle);
+
+  /**
+   * @see Legion::Domain::RectInDomainIterator::valid()
+   */
+  bool
+  legion_rect_in_domain_iterator_valid_1d(
+                                    legion_rect_in_domain_iterator_1d_t handle);
+  bool
+  legion_rect_in_domain_iterator_valid_2d(
+                                    legion_rect_in_domain_iterator_2d_t handle);
+  bool
+  legion_rect_in_domain_iterator_valid_3d(
+                                    legion_rect_in_domain_iterator_3d_t handle);
+
+  /**
+   * @see Legion::Domain::RectInDomainIterator::step()
+   */
+  bool
+  legion_rect_in_domain_iterator_step_1d(
+                                    legion_rect_in_domain_iterator_1d_t handle);
+  bool
+  legion_rect_in_domain_iterator_step_2d(
+                                    legion_rect_in_domain_iterator_2d_t handle);
+  bool
+  legion_rect_in_domain_iterator_step_3d(
+                                    legion_rect_in_domain_iterator_3d_t handle);
+
+  /**
+   * @see Legion::Domain::RectInDomainIterator::operator*()
+   */
+  legion_rect_1d_t
+  legion_rect_in_domain_iterator_get_rect_1d(
+                                    legion_rect_in_domain_iterator_1d_t handle);
+  legion_rect_2d_t
+  legion_rect_in_domain_iterator_get_rect_2d(
+                                    legion_rect_in_domain_iterator_2d_t handle);
+  legion_rect_3d_t
+  legion_rect_in_domain_iterator_get_rect_3d(
+                                    legion_rect_in_domain_iterator_3d_t handle);
+
 
   // -----------------------------------------------------------------------
   // Coloring Operations
@@ -900,6 +1011,30 @@ extern "C" {
   legion_index_space_destroy(legion_runtime_t runtime,
                              legion_context_t ctx,
                              legion_index_space_t handle);
+
+  /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_index_space_attach_semantic_information(legion_runtime_t runtime,
+                                                 legion_index_space_t handle,
+                                                 legion_semantic_tag_t tag,
+                                                 const void *buffer,
+                                                 size_t size,
+                                                 bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_index_space_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_index_space_t handle,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
 
   /**
    * @see Legion::Runtime::attach_name()
@@ -1280,6 +1415,31 @@ extern "C" {
                                  legion_index_partition_t handle);
 
   /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_index_partition_attach_semantic_information(
+                                                legion_runtime_t runtime,
+                                                legion_index_partition_t handle,
+                                                legion_semantic_tag_t tag,
+                                                const void *buffer,
+                                                size_t size,
+                                                bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_index_partition_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_index_partition_t handle,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
+
+  /**
    * @see Legion::Runtime::attach_name()
    */
   void
@@ -1318,6 +1478,57 @@ extern "C" {
   legion_field_space_destroy(legion_runtime_t runtime,
                              legion_context_t ctx,
                              legion_field_space_t handle);
+
+  /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_field_space_attach_semantic_information(
+                                                legion_runtime_t runtime,
+                                                legion_field_space_t handle,
+                                                legion_semantic_tag_t tag,
+                                                const void *buffer,
+                                                size_t size,
+                                                bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_field_space_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_field_space_t handle,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
+
+  /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_field_id_attach_semantic_information(legion_runtime_t runtime,
+                                              legion_field_space_t handle,
+                                              legion_field_id_t id,
+                                              legion_semantic_tag_t tag,
+                                              const void *buffer,
+                                              size_t size,
+                                              bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_field_id_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_field_space_t handle,
+                                           legion_field_id_t id,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
 
   /**
    * @see Legion::Runtime::attach_name()
@@ -1410,6 +1621,31 @@ extern "C" {
   legion_logical_region_get_parent_logical_partition(
     legion_runtime_t runtime,
     legion_logical_region_t handle);
+
+  /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_logical_region_attach_semantic_information(
+                                                legion_runtime_t runtime,
+                                                legion_logical_region_t handle,
+                                                legion_semantic_tag_t tag,
+                                                const void *buffer,
+                                                size_t size,
+                                                bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_logical_region_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_logical_region_t handle,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
 
   /**
    * @see Legion::Runtime::attach_name()
@@ -1526,6 +1762,31 @@ extern "C" {
   legion_logical_partition_get_parent_logical_region(
     legion_runtime_t runtime,
     legion_logical_partition_t handle);
+
+  /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_logical_partition_attach_semantic_information(
+                                                legion_runtime_t runtime,
+                                                legion_logical_partition_t handle,
+                                                legion_semantic_tag_t tag,
+                                                const void *buffer,
+                                                size_t size,
+                                                bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_logical_partition_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_logical_partition_t handle,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
 
   /**
    * @see Legion::Runtime::attach_name()
@@ -2007,6 +2268,88 @@ extern "C" {
                                legion_domain_point_t point);
 
   // -----------------------------------------------------------------------
+  // Deferred Buffer Operations
+  // -----------------------------------------------------------------------
+
+  /**
+   * @return Caller takes ownership of return value.
+   *
+   * @see Legion::DeferredBuffer::DeferredBuffer()
+   */
+  legion_deferred_buffer_char_1d_t
+  legion_deferred_buffer_char_1d_create(
+      legion_rect_1d_t bounds,
+      legion_memory_kind_t kind,
+      char *initial_value);
+
+  /*
+   * @see Legion::DeferredBuffer::ptr()
+   */
+  char*
+  legion_deferred_buffer_char_1d_ptr(
+      legion_deferred_buffer_char_1d_t buffer,
+      legion_point_1d_t p);
+
+  /*
+   * @see Legion::DeferredBuffer::~DeferredBuffer()
+   */
+  void
+  legion_deferred_buffer_char_1d_destroy(
+      legion_deferred_buffer_char_1d_t buffer);
+
+  /**
+   * @return Caller takes ownership of return value.
+   *
+   * @see Legion::DeferredBuffer::DeferredBuffer()
+   */
+  legion_deferred_buffer_char_2d_t
+  legion_deferred_buffer_char_2d_create(
+      legion_rect_2d_t bounds,
+      legion_memory_kind_t kind,
+      char *initial_value);
+
+  /*
+   * @see Legion::DeferredBuffer::ptr()
+   */
+  char*
+  legion_deferred_buffer_char_2d_ptr(
+      legion_deferred_buffer_char_2d_t buffer,
+      legion_point_2d_t p);
+
+  /*
+   * @see Legion::DeferredBuffer::~DeferredBuffer()
+   */
+  void
+  legion_deferred_buffer_char_2d_destroy(
+      legion_deferred_buffer_char_2d_t buffer);
+
+  /**
+   * @return Caller takes ownership of return value.
+   *
+   * @see Legion::DeferredBuffer::DeferredBuffer()
+   */
+  legion_deferred_buffer_char_3d_t
+  legion_deferred_buffer_char_3d_create(
+      legion_rect_3d_t bounds,
+      legion_memory_kind_t kind,
+      char *initial_value);
+
+  /*
+   * @see Legion::DeferredBuffer::ptr()
+   */
+  char*
+  legion_deferred_buffer_char_3d_ptr(
+      legion_deferred_buffer_char_3d_t buffer,
+      legion_point_3d_t p);
+
+  /*
+   * @see Legion::DeferredBuffer::~DeferredBuffer()
+   */
+  void
+  legion_deferred_buffer_char_3d_destroy(
+      legion_deferred_buffer_char_3d_t buffer);
+
+  // -----------------------------------------------------------------------
   // Task Launch Operations
   // -----------------------------------------------------------------------
 
@@ -2123,6 +2466,20 @@ extern "C" {
   void
   legion_task_launcher_add_arrival_barrier(legion_task_launcher_t launcher,
                                            legion_phase_barrier_t bar);
+
+  /**
+   * @see Legion::TaskLauncher::point
+   */
+  void
+  legion_task_launcher_set_point(legion_task_launcher_t launcher,
+                                 legion_domain_point_t point);
+
+  /**
+   * @see Legion::TaskLauncher::sharding_space
+   */
+  void
+  legion_task_launcher_set_sharding_space(legion_task_launcher_t launcher,
+                                          legion_index_space_t is);
 
   /**
    * @return Caller takes ownership of return value.
@@ -2281,6 +2638,13 @@ extern "C" {
   void
   legion_index_launcher_add_arrival_barrier(legion_index_launcher_t launcher,
                                             legion_phase_barrier_t bar);
+
+  /**
+   * @see Legion::IndexTaskLauncher::sharding_space
+   */
+  void
+  legion_index_launcher_set_sharding_space(legion_index_launcher_t launcher,
+                                           legion_index_space_t is);
 
   // -----------------------------------------------------------------------
   // Inline Mapping Operations
@@ -2928,7 +3292,8 @@ extern "C" {
   void
   legion_runtime_begin_trace(legion_runtime_t runtime,
                              legion_context_t ctx,
-                             legion_trace_id_t tid);
+                             legion_trace_id_t tid,
+                             bool memoize);
 
   /**
    * @see Legion::Runtime::end_trace()
@@ -2937,6 +3302,14 @@ extern "C" {
   legion_runtime_end_trace(legion_runtime_t runtime,
                            legion_context_t ctx,
                            legion_trace_id_t tid);
+
+  // -----------------------------------------------------------------------
+  // Frame Operations
+  // -----------------------------------------------------------------------
+
+  void
+  legion_runtime_complete_frame(legion_runtime_t runtime,
+                                legion_context_t ctx);
 
   // -----------------------------------------------------------------------
   // Tunable Variables
@@ -3024,6 +3397,12 @@ extern "C" {
   legion_physical_region_get_field_accessor_array_1d(
     legion_physical_region_t handle,
     legion_field_id_t fid);
+
+  legion_accessor_array_1d_t
+  legion_physical_region_get_field_accessor_array_1d_with_transform(
+      legion_physical_region_t handle,
+      legion_field_id_t fid,
+      legion_domain_affine_transform_t transform);
   
   /**
    * @return Caller takes ownership of return value.
@@ -3035,6 +3414,12 @@ extern "C" {
     legion_physical_region_t handle,
     legion_field_id_t fid);
 
+  legion_accessor_array_2d_t
+  legion_physical_region_get_field_accessor_array_2d_with_transform(
+    legion_physical_region_t handle,
+    legion_field_id_t fid,
+    legion_domain_affine_transform_t transform);
+
   /**
    * @return Caller takes ownership of return value.
    *
@@ -3044,6 +3429,12 @@ extern "C" {
   legion_physical_region_get_field_accessor_array_3d(
     legion_physical_region_t handle,
     legion_field_id_t fid);
+
+  legion_accessor_array_3d_t
+  legion_physical_region_get_field_accessor_array_3d_with_transform(
+    legion_physical_region_t handle,
+    legion_field_id_t fid,
+    legion_domain_affine_transform_t transform);
 
   void *
   legion_accessor_array_1d_raw_rect_ptr(legion_accessor_array_1d_t handle,
@@ -3205,6 +3596,30 @@ extern "C" {
    */
   legion_mapping_tag_id_t
   legion_task_get_tag(legion_task_t task);
+
+  /**
+   * @see Legion::Runtime::attach_semantic_information()
+   */
+  void
+  legion_task_id_attach_semantic_information(legion_runtime_t runtime,
+                                             legion_task_id_t task_id,
+                                             legion_semantic_tag_t tag,
+                                             const void *buffer,
+                                             size_t size,
+                                             bool is_mutable /* = false */);
+
+  /**
+   * @see Legion::Runtime::retrieve_semantic_information()
+   */
+  void
+  legion_task_id_retrieve_semantic_information(
+                                           legion_runtime_t runtime,
+                                           legion_task_id_t task_id,
+                                           legion_semantic_tag_t tag,
+                                           const void **result,
+                                           size_t *size,
+                                           bool can_fail /* = false */,
+                                           bool wait_until_ready /* = false */);
 
   /**
    * @see Legion::Runtime::attach_name()
@@ -3657,9 +4072,21 @@ extern "C" {
   void
   legion_runtime_preregister_projection_functor(
     legion_projection_id_t id,
+    bool exclusive,
     unsigned depth,
     legion_projection_functor_logical_region_t region_functor,
     legion_projection_functor_logical_partition_t partition_functor);
+
+  /**
+   * @see Legion::Runtime::preregister_projection_functor()
+   */
+  void
+  legion_runtime_preregister_projection_functor_mappable(
+    legion_projection_id_t id,
+    bool exclusive,
+    unsigned depth,
+    legion_projection_functor_logical_region_mappable_t region_functor,
+    legion_projection_functor_logical_partition_mappable_t partition_functor);
 
   /**
    * @see Legion::Runtime::register_projection_functor()
@@ -3668,9 +4095,22 @@ extern "C" {
   legion_runtime_register_projection_functor(
     legion_runtime_t runtime,
     legion_projection_id_t id,
+    bool exclusive,
     unsigned depth,
     legion_projection_functor_logical_region_t region_functor,
     legion_projection_functor_logical_partition_t partition_functor);
+
+  /**
+   * @see Legion::Runtime::register_projection_functor()
+   */
+  void
+  legion_runtime_register_projection_functor_mappable(
+    legion_runtime_t runtime,
+    legion_projection_id_t id,
+    bool exclusive,
+    unsigned depth,
+    legion_projection_functor_logical_region_mappable_t region_functor,
+    legion_projection_functor_logical_partition_mappable_t partition_functor);
 
   /**
    * @see Legion::Runtime::generate_library_task_ids()
@@ -3689,6 +4129,7 @@ extern "C" {
     legion_runtime_t runtime,
     legion_task_id_t id /* = AUTO_GENERATE_ID */,
     const char *task_name /* = NULL*/,
+    const char *variant_name /* = NULL*/,
     bool global,
     legion_execution_constraint_set_t execution_constraints,
     legion_task_layout_constraint_set_t layout_constraints,
@@ -3704,6 +4145,7 @@ extern "C" {
   legion_runtime_preregister_task_variant_fnptr(
     legion_task_id_t id /* = AUTO_GENERATE_ID */,
     const char *task_name /* = NULL*/,
+    const char *variant_name /* = NULL*/,
     legion_execution_constraint_set_t execution_constraints,
     legion_task_layout_constraint_set_t layout_constraints,
     legion_task_config_options_t options,
@@ -3757,6 +4199,24 @@ extern "C" {
     legion_task_config_options_t options,
     const char *module_name,
     const char *function_name,
+    const void *userdata,
+    size_t userlen);
+
+  /**
+   * @see Legion::Runtime::register_task_variant()
+   */
+  legion_task_id_t
+  legion_runtime_register_task_variant_python_source_qualname(
+    legion_runtime_t runtime,
+    legion_task_id_t id /* = AUTO_GENERATE_ID */,
+    const char *task_name /* = NULL*/,
+    bool global,
+    legion_execution_constraint_set_t execution_constraints,
+    legion_task_layout_constraint_set_t layout_constraints,
+    legion_task_config_options_t options,
+    const char *module_name,
+    const char **function_qualname,
+    size_t function_qualname_len,
     const void *userdata,
     size_t userlen);
 

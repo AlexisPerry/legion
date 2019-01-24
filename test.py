@@ -64,7 +64,7 @@ legion_cxx_tests = [
 ]
 
 if platform.system() != 'Darwin':
-    legion_cxx_tests = legion_cxx_tests + [
+    legion_cxx_tests += [
         # FIXME: Fails non-deterministically on Mac OS: https://github.com/StanfordLegion/legion/issues/213
         ['test/attach_file_mini/attach_file_mini', []],
     ]
@@ -81,9 +81,12 @@ legion_openmp_cxx_tests = [
 
 legion_python_cxx_tests = [
     # Bindings
-    ['bindings/python/legion_python', ['hello', '-ll:py', '1', '-ll:cpu', '0']],
-    ['bindings/python/legion_python', ['region', '-ll:py', '1', '-ll:cpu', '0']],
-    ['bindings/python/legion_python', ['index_launch', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['examples/future.py', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['examples/hello.py', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['examples/index_launch.py', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['examples/method.py', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['examples/region.py', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['examples/tunable.py', '-ll:py', '1', '-ll:cpu', '0']],
 
     # Examples
     ['examples/python_interop/python_interop', ['-ll:py', '1']],
@@ -93,12 +96,15 @@ legion_python_cxx_tests = [
 ]
 
 legion_hdf_cxx_tests = [
-    # Examples
-    ['examples/attach_file/attach_file', []],
-
     # Tests
     ['test/hdf_attach_subregion_parallel/hdf_attach_subregion_parallel', ['-ll:cpu', '4']],
 ]
+
+if platform.system() != 'Darwin':
+    legion_hdf_cxx_tests += [
+        # FIXME: Fails non-deterministically on Mac OS: https://github.com/StanfordLegion/legion/issues/213
+        ['examples/attach_file/attach_file', []],
+    ]
 
 def get_legion_cxx_perf_tests(nodes, cores_per_node):
     return [
@@ -197,8 +203,7 @@ def run_test_legion_python_cxx(launcher, root_dir, tmp_dir, bin_dir, env, thread
     flags = [] # ['-logfile', 'out_%.log']
     # Hack: Fix up the environment so that Python can find all the examples.
     env = dict(list(env.items()) + [
-        ('PYTHONPATH', ':'.join([os.path.join(root_dir, 'bindings', 'python'),
-                                 os.path.join(root_dir, 'bindings', 'python', 'examples')])),
+        ('PYTHONPATH', ':'.join([os.path.join(root_dir, 'bindings', 'python')])),
     ])
     run_cxx(legion_python_cxx_tests, flags, launcher, root_dir, bin_dir, env, thread_count)
 
@@ -218,8 +223,8 @@ def run_test_fuzzer(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
 
 def run_test_realm(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
     test_dir = os.path.join(root_dir, 'test/realm')
-    cmd(['make', '-C', test_dir, 'DEBUG=0', 'USE_CUDA=0', 'USE_GASNET=0', 'clean'], env=env)
-    cmd(['make', '-C', test_dir, 'DEBUG=0', 'USE_CUDA=0', 'USE_GASNET=0', 'run_all'], env=env)
+    cmd(['make', '-C', test_dir, 'DEBUG=0', 'clean'], env=env)
+    cmd(['make', '-C', test_dir, 'DEBUG=0', 'run_all'], env=env)
 
 def run_test_external(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
     flags = ['-logfile', 'out_%.log']
@@ -233,6 +238,7 @@ def run_test_external(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
     # Contact: Chao Chen <cchen10@stanford.edu>
     solver_dir = os.path.join(tmp_dir, 'fastSolver2')
     cmd(['git', 'clone', 'https://github.com/Charles-Chao-Chen/fastSolver2.git', solver_dir])
+    # cmd(['git', 'checkout', '4c7a59de63dd46a0abcc7f296fa3b0f511e5e6d2', ], cwd=solver_dir)
     solver = [[os.path.join(solver_dir, 'spmd_driver/solver'),
                ['-machine', '1', '-core', '8', '-mtxlvl', '6', '-ll:cpu', '8']]]
     run_cxx(solver, flags, launcher, root_dir, None, env, thread_count)
@@ -286,6 +292,23 @@ def run_test_external(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
         ('LEGION_ROOT', root_dir),
     ])
     cmd(['make', '-C', os.path.join(task_amr_dir)], env=task_amr_env)
+
+    # Barnes-Hut
+    # Contact: Haithem Turki <turki.haithem@gmail.com>
+    barnes_hut_dir = os.path.join(tmp_dir, 'barnes_hut')
+    cmd(['git', 'clone', 'https://github.com/StanfordLegion/barnes-hut.git', barnes_hut_dir])
+    regent_path = os.path.join(root_dir, 'language', 'regent.py')
+    cmd([regent_path, 'hdf5_converter.rg',
+         '-i', 'input/bodies-16384-blitz.csv',
+         '-o', 'bodies-16384-blitz.h5',
+         '-n', '16384'],
+        cwd=barnes_hut_dir,
+        env=env)
+    cmd([regent_path, 'barnes_hut.rg',
+         '-i', 'bodies-16384-blitz.h5',
+         '-n', '16384'],
+        cwd=barnes_hut_dir,
+        env=env)
 
 def run_test_private(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
     flags = ['-logfile', 'out_%.log']
@@ -518,6 +541,8 @@ def build_cmake(root_dir, tmp_dir, env, thread_count,
     cmdline.append('-DLegion_USE_GASNet=%s' % ('ON' if env['USE_GASNET'] == '1' else
                                                'OFF'))
     cmdline.append('-DLegion_USE_CUDA=%s' % ('ON' if env['USE_CUDA'] == '1' else 'OFF'))
+    cmdline.append('-DLegion_USE_Python=%s' % ('ON' if env['USE_PYTHON'] == '1' else 'OFF'))
+    cmdline.append('-DBUILD_SHARED_LIBS=%s' % ('ON' if env['USE_PYTHON'] == '1' else 'OFF'))
     cmdline.append('-DLegion_USE_LLVM=%s' % ('ON' if env['USE_LLVM'] == '1' else 'OFF'))
     cmdline.append('-DLegion_USE_HDF5=%s' % ('ON' if env['USE_HDF'] == '1' else 'OFF'))
     if test_ctest:
@@ -590,7 +615,7 @@ class Stage(object):
 def report_mode(debug, launcher,
                 test_regent, test_legion_cxx, test_fuzzer, test_realm,
                 test_external, test_private, test_perf, test_ctest, use_gasnet,
-                use_cuda, use_openmp, use_python, use_llvm, use_hdf, use_spy,
+                use_cuda, use_openmp, use_python, use_llvm, use_hdf, use_spy, use_prof,
                 use_gcov, use_cmake, use_rdir):
     print()
     print('#'*60)
@@ -617,6 +642,7 @@ def report_mode(debug, launcher,
     print('###   * LLVM:       %s' % use_llvm)
     print('###   * HDF5:       %s' % use_hdf)
     print('###   * Spy:        %s' % use_spy)
+    print('###   * Prof:       %s' % use_prof)
     print('###   * Gcov:       %s' % use_gcov)
     print('###   * CMake:      %s' % use_cmake)
     print('###   * RDIR:       %s' % use_rdir)
@@ -661,6 +687,7 @@ def run_tests(test_modules=None,
     use_llvm = feature_enabled('llvm', False)
     use_hdf = feature_enabled('hdf', False)
     use_spy = feature_enabled('spy', False)
+    use_prof = feature_enabled('prof', False)
     use_gcov = feature_enabled('gcov', False)
     use_cmake = feature_enabled('cmake', False)
     use_rdir = feature_enabled('rdir', True)
@@ -694,7 +721,7 @@ def run_tests(test_modules=None,
                 test_regent, test_legion_cxx, test_fuzzer, test_realm,
                 test_external, test_private, test_perf, test_ctest,
                 use_gasnet,
-                use_cuda, use_openmp, use_python, use_llvm, use_hdf, use_spy,
+                use_cuda, use_openmp, use_python, use_llvm, use_hdf, use_spy, use_prof,
                 use_gcov, use_cmake, use_rdir)
 
     tmp_dir = tempfile.mkdtemp(dir=root_dir)
@@ -713,11 +740,14 @@ def run_tests(test_modules=None,
         ('USE_OPENMP', '1' if use_openmp else '0'),
         ('TEST_OPENMP', '1' if use_openmp else '0'),
         ('USE_PYTHON', '1' if use_python else '0'),
+        ('TEST_PYTHON', '1' if use_python else '0'),
         ('USE_LLVM', '1' if use_llvm else '0'),
         ('USE_HDF', '1' if use_hdf else '0'),
         ('TEST_HDF', '1' if use_hdf else '0'),
         ('USE_SPY', '1' if use_spy else '0'),
         ('TEST_SPY', '1' if use_spy else '0'),
+        ('USE_PROF', '1' if use_prof else '0'),
+        ('TEST_PROF', '1' if use_prof else '0'),
         ('TEST_GCOV', '1' if use_gcov else '0'),
         ('USE_RDIR', '1' if use_rdir else '0'),
         ('LG_RT_DIR', os.path.join(root_dir, 'runtime')),
@@ -849,7 +879,7 @@ def driver():
     parser.add_argument(
         '--use', dest='use_features', action=ExtendAction,
         choices=MultipleChoiceList('gasnet', 'cuda', 'openmp',
-                                   'python', 'llvm', 'hdf', 'spy',
+                                   'python', 'llvm', 'hdf', 'spy', 'prof',
                                    'gcov', 'cmake', 'rdir'),
         type=lambda s: s.split(','),
         default=None,

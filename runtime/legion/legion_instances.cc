@@ -114,7 +114,7 @@ namespace Legion {
       : allocated_fields(mask), constraints(con), owner(own), total_dims(dims)
     //--------------------------------------------------------------------------
     {
-      constraints->add_reference();
+      constraints->add_base_gc_ref(LAYOUT_DESC_REF);
       field_infos.resize(field_sizes.size());
       // Switch data structures from layout by field order to order
       // of field locations in the bit mask
@@ -141,7 +141,7 @@ namespace Legion {
       : allocated_fields(mask), constraints(con), owner(NULL), total_dims(0)
     //--------------------------------------------------------------------------
     {
-      constraints->add_reference();
+      constraints->add_base_gc_ref(LAYOUT_DESC_REF);
     }
 
     //--------------------------------------------------------------------------
@@ -159,7 +159,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       comp_cache.clear();
-      if (constraints->remove_reference())
+      if (constraints->remove_base_gc_ref(LAYOUT_DESC_REF))
         delete (constraints);
     }
 
@@ -1674,7 +1674,8 @@ namespace Legion {
         const std::vector<CopySrcDstField> &src_fields,
         const std::vector<CopySrcDstField> &dst_fields,
         RegionTreeNode *dst, ApEvent precondition, PredEvent guard,
-        bool reduction_fold, bool precise, RegionTreeNode *intersect)
+        bool reduction_fold, bool precise, PhysicalTraceInfo &trace_info,
+        RegionTreeNode *intersect)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -1817,7 +1818,8 @@ namespace Legion {
         const std::vector<CopySrcDstField> &src_fields,
         const std::vector<CopySrcDstField> &dst_fields,
         RegionTreeNode *dst, ApEvent precondition, PredEvent guard,
-        bool reduction_fold, bool precise, RegionTreeNode *intersect)
+        bool reduction_fold, bool precise,
+        PhysicalTraceInfo &trace_info, RegionTreeNode *intersect)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -1825,7 +1827,8 @@ namespace Legion {
 #endif
       // Doesn't matter if this one is precise or not
       return dst->issue_copy(op, src_fields, dst_fields, precondition,
-                             guard, intersect, redop, reduction_fold);
+                             guard, trace_info, intersect, redop,
+                             reduction_fold);
     }
 
     //--------------------------------------------------------------------------
@@ -2053,7 +2056,8 @@ namespace Legion {
       {
         // First make a new layout constraint
         LayoutConstraints *layout_constraints = 
-         forest->runtime->register_layout(field_node->handle,constraints);
+          forest->runtime->register_layout(field_node->handle,
+                                           constraints, true/*internal*/);
         // Then make our description
         layout = field_node->create_layout_description(instance_mask, num_dims,
                                   layout_constraints, mask_index_map,
@@ -2111,6 +2115,7 @@ namespace Legion {
                 constraints.field_constraint.get_field_set();
               layout->compute_copy_offsets(fill_fields, result, dsts);
             }
+            PhysicalTraceInfo info;
 #ifdef LEGION_SPY
             std::vector<Realm::CopySrcDstField> realm_dsts(dsts.size());
             for (unsigned idx = 0; idx < dsts.size(); idx++)
@@ -2118,12 +2123,12 @@ namespace Legion {
             ApEvent filled =
               instance_domain->issue_fill(NULL/*op*/, realm_dsts, fill_buffer,
                                           reduction_op->sizeof_rhs, ready,
-                                          PredEvent::NO_PRED_EVENT);
+                                          PredEvent::NO_PRED_EVENT, info);
 #else
             ApEvent filled =
               instance_domain->issue_fill(NULL/*op*/, dsts, fill_buffer,
                                           reduction_op->sizeof_rhs, ready,
-                                          PredEvent::NO_PRED_EVENT);
+                                          PredEvent::NO_PRED_EVENT, info);
 #endif
             // We can free the buffer after we've issued the fill
             free(fill_buffer);
@@ -2235,7 +2240,7 @@ namespace Legion {
               non_empty_regions.begin(); it != 
               non_empty_regions.end(); it++, index++)
         {
-          union_spaces[index++] = (*it)->row_source->handle;
+          union_spaces[index] = (*it)->row_source->handle;
           // Also find the common ancestor
           if (index > 0)
             ancestor = find_common_ancestor(ancestor, *it);
@@ -2489,6 +2494,55 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       const OrderingConstraint &ord = constraints.ordering_constraint;
+
+      std::map<FieldID, size_t> field_alignments;
+      if (ord.ordering.front() == DIM_F)
+      {
+        // AOS - all field in same group
+        // Use a GCD of field sizes by default to make fields tighly packed
+#ifdef DEBUG_LEGION
+        assert(field_set.size() > 0);
+        assert(field_sizes.size() > 0);
+#endif
+        // Start with an initial upper bound on alignment of 32
+        size_t gcd = 32;
+        for (unsigned idx = 0; idx < field_set.size(); idx++)
+        {
+          size_t next = field_sizes[idx];
+          while (next != 0)
+          {
+            size_t mod = gcd % next;
+            gcd = next;
+            next = mod;
+          }
+        }
+#ifdef DEBUG_LEGION
+        assert(gcd != 0);
+#endif
+        for (unsigned idx = 0; idx < field_set.size(); idx++)
+          field_alignments[field_set[idx]] = gcd;
+      }
+      else if (ord.ordering.back() == DIM_F)
+      {
+        // SOA - each field is its own group
+        // Use a GCD(sizeof(T),32)
+        for (unsigned idx = 0; idx < field_set.size(); idx++)
+          field_alignments[field_set[idx]] = 
+            (field_sizes[idx] | 32) & ~((field_sizes[idx] | 32) - 1);
+      }
+      else // Have to be AOS or SOA for now
+        assert(false);
+
+      const std::vector<AlignmentConstraint> &alignments =
+        constraints.alignment_constraints;
+      for (std::vector<AlignmentConstraint>::const_iterator it =
+           alignments.begin(); it != alignments.end(); ++it)
+      {
+        // TODO: We support only equality constraints for now
+        assert(it->eqk != EQ_EK);
+        field_alignments[it->fid] = it->alignment;
+      }
+
       if (ord.ordering.front() == DIM_F)
       {
         // AOS - all field in same group
@@ -2496,11 +2550,15 @@ namespace Legion {
         realm_constraints.field_groups[0].resize(field_set.size());
         for (unsigned idx = 0; idx < field_set.size(); idx++)
         {
+#ifdef DEBUG_LEGION
+          assert(field_alignments.find(field_set[idx]) !=
+                 field_alignments.end());
+#endif
           realm_constraints.field_groups[0][idx].field_id = field_set[idx];
           realm_constraints.field_groups[0][idx].offset = -1;
           realm_constraints.field_groups[0][idx].size = field_sizes[idx];
-          // Natrual alignment
-          realm_constraints.field_groups[0][idx].alignment = field_sizes[idx];
+          realm_constraints.field_groups[0][idx].alignment =
+            field_alignments[field_set[idx]];
         }
       }
       else if (ord.ordering.back() == DIM_F)
@@ -2509,20 +2567,21 @@ namespace Legion {
         realm_constraints.field_groups.resize(field_set.size());
         for (unsigned idx = 0; idx < field_set.size(); idx++)
         {
+#ifdef DEBUG_LEGION
+          assert(field_alignments.find(field_set[idx]) !=
+                 field_alignments.end());
+#endif
           realm_constraints.field_groups[idx].resize(1);
           realm_constraints.field_groups[idx][0].field_id = field_set[idx];
           realm_constraints.field_groups[idx][0].offset = -1;
           realm_constraints.field_groups[idx][0].size = field_sizes[idx];
-          // Natural alignment
-          realm_constraints.field_groups[idx][0].alignment = field_sizes[idx];
+          realm_constraints.field_groups[idx][0].alignment =
+            field_alignments[field_set[idx]];
         }
       }
       else // Have to be AOS or SOA for now
         assert(false);
       // TODO: Next go through and check for any offset constraints for fields
-
-      // TODO: Then update the alignments per the alignment constraints
-
     }
     
   }; // namespace Internal

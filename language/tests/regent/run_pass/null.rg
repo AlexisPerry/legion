@@ -22,5 +22,8 @@ task main()
   var is = ispace(ptr, 5)
   var y = null(ptr(is))
   regentlib.assert(isnull(y), "test failed")
+
+  var z = null(&int)
+  regentlib.assert(isnull(z), "test failed")
 end
 regentlib.start(main)

@@ -59,6 +59,7 @@ inline void makecontext_wrap(ucontext_t *u, void (*fn)(), int args, ...) { makec
 
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <signal.h>
 #include <string>
 #include <map>
@@ -668,6 +669,8 @@ namespace Realm {
     void (*entry_wrapper)(void *);
     pthread_t thread;
     bool ok_to_delete;
+    void *altstack_base;
+    size_t altstack_size;
   };
 
   KernelThread::KernelThread(void *_target, void (*_entry_wrapper)(void *),
@@ -687,6 +690,15 @@ namespace Realm {
   {
     KernelThread *thread = (KernelThread *)data;
 
+    // install our alt stack (if it exists) for signal handling
+    if(thread->altstack_base != 0) {
+      stack_t altstack = { .ss_sp = thread->altstack_base,
+			   .ss_flags = 0,
+			   .ss_size = thread->altstack_size };
+      int ret = sigaltstack(&altstack, 0);
+      assert(ret == 0);
+    }
+
     // set up TLS so people can find us
     ThreadLocal::current_thread = thread;
 
@@ -702,6 +714,26 @@ namespace Realm {
     // on return, we update our status and terminate
     log_thread.info() << "thread " << thread << " finished";
     thread->update_state(STATE_FINISHED);
+
+    // uninstall and free our alt stack (if it exists)
+    if(thread->altstack_base != 0) {
+      // so MacOS doesn't seem to want to let you disable a stack, returning
+      //  EINVAL even if the stack is not active - free the memory anyway
+#ifndef __MACH__
+      stack_t disabled = { .ss_sp = 0,
+			   .ss_flags = SS_DISABLE };
+      stack_t oldstack;
+      int ret = sigaltstack(&disabled, &oldstack);
+      assert(ret == 0);
+      // in a perfect world, we'd double-check that it's our stack we
+      //  unloaded, but some libraries (e.g. libpython 3.4) do not clean
+      //  up properly, so our stack may not have been active anyway
+      // either way though, it's not active after the call above, so it's
+      //  safe to free the memory now
+      //assert(oldstack.ss_sp == thread->altstack_base);
+#endif
+      free(thread->altstack_base);
+    }
 
     // this is last so that the scheduler can delete us if it wants to
     if(thread->scheduler)
@@ -741,26 +773,40 @@ namespace Realm {
 				        (PTHREAD_STACK_MIN * 2) :
 				        (256 << 10));
 
+    ptrdiff_t stack_size = 0;  // 0 == "pthread default"
+
     if(params.stack_size != params.STACK_SIZE_DEFAULT) {
       // make sure it's not too large
       assert((rsrv.params.max_stack_size == rsrv.params.STACK_SIZE_DEFAULT) ||
 	     (params.stack_size <= rsrv.params.max_stack_size));
 
-      if(params.stack_size < MIN_STACK_SIZE)
-	CHECK_PTHREAD( pthread_attr_setstacksize(&attr, MIN_STACK_SIZE) );
-      else
-	CHECK_PTHREAD( pthread_attr_setstacksize(&attr, params.stack_size) );
+      stack_size = std::max<ptrdiff_t>(params.stack_size, MIN_STACK_SIZE);
     } else {
       // does the entire core reservation have a non-standard stack size?
       if(rsrv.params.max_stack_size != rsrv.params.STACK_SIZE_DEFAULT) {
-	if(rsrv.params.max_stack_size < MIN_STACK_SIZE)
-	  CHECK_PTHREAD( pthread_attr_setstacksize(&attr, MIN_STACK_SIZE) );
-	else
-	  CHECK_PTHREAD( pthread_attr_setstacksize(&attr, rsrv.params.max_stack_size) );
+	stack_size = std::max<ptrdiff_t>(rsrv.params.max_stack_size,
+					 MIN_STACK_SIZE);
       }
     }
+    if(stack_size > 0)
+      CHECK_PTHREAD( pthread_attr_setstacksize(&attr, stack_size) );
 
     // TODO: actually use heap size
+
+    // default altstack size is 64KB
+    altstack_size = 64 << 10;
+    if(params.alt_stack_size != params.ALTSTACK_SIZE_DEFAULT)
+      altstack_size = params.alt_stack_size;
+    else if(rsrv.params.alt_stack_size != rsrv.params.ALTSTACK_SIZE_DEFAULT)
+      altstack_size = rsrv.params.alt_stack_size;
+
+    if(altstack_size > 0) {
+      int ret = posix_memalign(&altstack_base,
+			       sysconf(_SC_PAGESIZE),
+			       altstack_size);
+      assert(ret == 0);
+    } else
+      altstack_base = 0;
 
     update_state(STATE_STARTUP);
 
@@ -769,7 +815,8 @@ namespace Realm {
 
     CHECK_PTHREAD( pthread_attr_destroy(&attr) );
 
-    log_thread.info() << "thread created:" << this << " (" << rsrv.name << ") - pthread " << thread;
+    log_thread.info() << "thread created:" << this << " (" << rsrv.name << ") - pthread " << std::hex << thread << std::dec;
+    log_thread.debug() << "thread stack: " << this << " size=" << stack_size;
   }
 
   void KernelThread::join(void)
@@ -906,7 +953,8 @@ namespace Realm {
 
     virtual ~UserThread(void);
 
-    void start_thread(const ThreadLaunchParameters& params);
+    void start_thread(const ThreadLaunchParameters& params,
+		      const CoreReservation *rsrv);
 
     virtual void join(void);
     virtual void detach(void);
@@ -994,17 +1042,27 @@ namespace Realm {
     }
   }
 
-  void UserThread::start_thread(const ThreadLaunchParameters& params)
+  void UserThread::start_thread(const ThreadLaunchParameters& params,
+				const CoreReservation *rsrv)
   {
-    // figure out how big the stack should be
+    // it turns out MacOS behaves REALLY strangely with a stack < 32KB, and there
+    //  make be some lower limit in Linux-land too, so clamp to 64KB to be safe
+    const ptrdiff_t MIN_STACK_SIZE = 64 << 10;
+
     if(params.stack_size != params.STACK_SIZE_DEFAULT) {
-      stack_size = params.stack_size;
-      // it turns out MacOS behaves REALLY strangely with a stack < 32KB, and there
-      //  make be some lower limit in Linux-land too, so clamp to 64KB to be safe
-      if(stack_size < (64 << 10))
-	stack_size = 64 << 10;
+      // make sure it's not too large
+      if(rsrv)
+	assert((rsrv->params.max_stack_size == rsrv->params.STACK_SIZE_DEFAULT) ||
+	       (params.stack_size <= rsrv->params.max_stack_size));
+
+      stack_size = std::max<ptrdiff_t>(params.stack_size, MIN_STACK_SIZE);
     } else {
-      stack_size = 2 << 20; // pick something - 2MB ?
+      // does the entire core reservation have a non-standard stack size?
+      if(rsrv &&
+	 (rsrv->params.max_stack_size != rsrv->params.STACK_SIZE_DEFAULT)) {
+	stack_size = std::max<ptrdiff_t>(rsrv->params.max_stack_size,
+					 MIN_STACK_SIZE);
+      }
     }
 
     stack_base = malloc(stack_size);
@@ -1022,6 +1080,9 @@ namespace Realm {
     makecontext(&ctx, uthread_entry, 0);
 
     update_state(STATE_STARTUP);    
+
+    log_thread.info() << "thread created:" << this << " (" << (rsrv ? rsrv->name : "??") << ") - user thread";
+    log_thread.debug() << "thread stack: " << this << " size=" << stack_size << " base=" << stack_base;
   }
 
   void UserThread::join(void)
@@ -1155,12 +1216,13 @@ namespace Realm {
 #ifdef REALM_USE_USER_THREADS
   /*static*/ Thread *Thread::create_user_thread_untyped(void *target, void (*entry_wrapper)(void *),
 							const ThreadLaunchParameters& params,
+							const CoreReservation *rsrv,
 							ThreadScheduler *_scheduler)
   {
     UserThread *t = new UserThread(target, entry_wrapper, _scheduler);
 
     // no need to wait on an allocation - the host thread will take care of that
-    t->start_thread(params);
+    t->start_thread(params, rsrv);
 
     return t;
   }

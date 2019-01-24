@@ -37,14 +37,19 @@ end
 -- ## Legion Bindings
 -- #################
 
-terralib.linklibrary("libregent.so")
+if data.is_luajit() then
+  terralib.linklibrary("libregent.so")
+end
 local c = terralib.includecstring([[
 #include "legion.h"
-#include "legion_terra.h"
-#include "legion_terra_partitions.h"
+#include "regent.h"
+#include "regent_partitions.h"
+#include "murmur_hash3.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -109,6 +114,46 @@ terra base.domain_from_bounds_3d(start : c.legion_point_3d_t,
     },
   }
   return c.legion_domain_from_rect_3d(rect)
+end
+
+-- A whitelist of functions that are known to be ok. We're importing a
+-- fixed list of known C headers above, so it should be ok to use a
+-- blacklist here.
+base.replicable_whitelist = {}
+do
+  local blacklist = data.set {
+    "fprintf",
+    "fscanf",
+    "printf",
+    "scanf",
+    "rand",
+    "rand_r",
+    "vfscanf",
+    "vscanf",
+  }
+  for k, v in pairs(c) do
+    if not blacklist[k] then
+      base.replicable_whitelist[v] = true
+    end
+  end
+
+  local other = {
+    base.assert_error,
+    base.assert,
+    base.domain_from_bounds_1d,
+    base.domain_from_bounds_2d,
+    base.domain_from_bounds_3d,
+
+    -- Terra functions that happen to be placed in global scope:
+    _G["sizeof"],
+    _G["vector"],
+    _G["vectorof"],
+    _G["array"],
+    _G["arrayof"],
+  }
+  for _, v in ipairs(other) do
+    base.replicable_whitelist[v] = true
+  end
 end
 
 -- #####################################
@@ -219,8 +264,20 @@ end
 
 local function zero(value_type) return terralib.cast(value_type, 0) end
 local function one(value_type) return terralib.cast(value_type, 1) end
-local function min_value(value_type) return terralib.cast(value_type, -math.huge) end
-local function max_value(value_type) return terralib.cast(value_type, math.huge) end
+local function min_value(value_type)
+  if type(rawget(value_type, "min")) == "function" then
+    return value_type:min()
+  else
+    return terralib.cast(value_type, -math.huge)
+  end
+end
+local function max_value(value_type)
+  if type(rawget(value_type, "max")) == "function" then
+    return value_type:max()
+  else
+    return terralib.cast(value_type, math.huge)
+  end
+end
 
 base.reduction_ops = terralib.newlist({
     {op = "+", name = "plus", init = zero},
@@ -579,6 +636,10 @@ function base.types.is_dynamic_collective(t)
   return terralib.types.istype(t) and rawget(t, "is_dynamic_collective") or false
 end
 
+function base.types.is_regent_array(t)
+  return terralib.types.istype(t) and rawget(t, "is_regent_array") or false
+end
+
 function base.types.is_unpack_result(t)
   return terralib.types.istype(t) and rawget(t, "is_unpack_result") or false
 end
@@ -619,7 +680,7 @@ function base.types.flatten_struct_fields(struct_type)
   end
 
   if (struct_type:isstruct() or base.types.is_fspace_instance(struct_type)) and
-     not is_geometric_type(struct_type) then
+     not (is_geometric_type(struct_type) or base.types.is_regent_array(struct_type)) then
     local entries = struct_type:getentries()
     for _, entry in ipairs(entries) do
       local entry_name = entry[1] or entry.field
@@ -727,7 +788,8 @@ function symbol:getlabel()
 end
 
 function symbol:hash()
-  return self
+  local hash_value = "__symbol_#" .. tostring(self.symbol_id)
+  return hash_value
 end
 
 function symbol:__tostring()
@@ -765,6 +827,14 @@ function base.variant:is_cuda()
   return self.cuda
 end
 
+function base.variant:set_is_openmp(openmp)
+  self.openmp = openmp
+end
+
+function base.variant:is_openmp()
+  return self.openmp
+end
+
 function base.variant:set_is_external(external)
   self.external = external
 end
@@ -794,6 +864,7 @@ do
       kernel = kernel,
     }
     global_kernel_id = global_kernel_id + 1
+    kernel:setname(kernel_name)
     return kernel_id
   end
 end
@@ -927,6 +998,22 @@ function base.variant:__tostring()
   return tostring(self.task:get_name()) .. '_' .. self:get_name()
 end
 
+function base.variant:add_layout_constraint(constraint)
+  if not self.layout_constraints then
+    self.layout_constraints = terralib.newlist()
+  end
+  self.layout_constraints:insert(constraint)
+end
+
+function base.variant:has_layout_constraints()
+  return self.layout_constraints
+end
+
+function base.variant:get_layout_constraints()
+  assert(self.layout_constraints)
+  return self.layout_constraints
+end
+
 do
   function base.new_variant(task, name)
     assert(base.is_task(task))
@@ -939,10 +1026,12 @@ do
       untyped_ast = false,
       definition = false,
       cuda = false,
+      openmp = false,
       external = false,
       inline = false,
       cudakernels = false,
       config_options = false,
+      layout_constraints = false,
     }, base.variant)
 
     task.variants:insert(variant)
@@ -1194,6 +1283,20 @@ function base.task:get_variants()
   return self.variants
 end
 
+function base.task:get_variant(name)
+  local variant = nil
+  for i = 1, #self.variants do
+    if self.variants[i]:get_name() == name then
+      variant = self.variants[i]
+      break
+    end
+  end
+  if variant == nil then
+    error("variant '" .. name .. "' does not exist")
+  end
+  return variant
+end
+
 function base.task:set_primary_variant(task)
   assert(not self.primary_variant)
   self.primary_variant = task
@@ -1233,19 +1336,21 @@ end
 
 function base.task:make_variant(name)
   assert(not self.is_complete)
-  return base.new_variant(self, name)
+  local variant = base.new_variant(self, name)
+  return variant
 end
 
-function base.task:add_complete_thunk(complete_thunk)
+function base.task:set_compile_thunk(compile_thunk)
   assert(not self.is_complete)
-  self.complete_thunks:insert(complete_thunk)
+  self.compile_thunk = compile_thunk
 end
 
 function base.task:complete()
-  if not self.is_complete then
+  if not self.is_inline and not self.is_complete then
     self.is_complete = true
-    for _, thunk in ipairs(self.complete_thunks) do
-      thunk()
+    if not self.compile_thunk then return end
+    for _, variant in ipairs(self.variants) do
+      self.compile_thunk(variant)
     end
   end
   return self
@@ -1253,6 +1358,23 @@ end
 
 function base.task:compile()
   return self:complete()
+end
+
+function base.task:set_is_inline(is_inline)
+  self.is_inline = is_inline
+end
+
+function base.task:set_optimization_thunk(optimization_thunk)
+  self.optimization_thunk = optimization_thunk
+end
+
+function base.task:optimize()
+  if self.is_inline then
+    if not self.optimization_thunk then return self end
+    self.optimization_thunk()
+    self.is_inline = false
+  end
+  return self
 end
 
 function base.task:__tostring()
@@ -1303,8 +1425,10 @@ do
       parallel_task = false,
 
       -- Compilation continuations:
-      complete_thunks = terralib.newlist(),
+      compile_thunk = false,
       is_complete = false,
+      optimization_thunk = false,
+      is_inline = false,
     }, base.task)
   end
 end

@@ -105,9 +105,9 @@ ast.annotation:leaf("Forbid", {"value"}, true)
 ast.annotation:leaf("Unroll", {"value"}, true)
 
 -- Annotation: Sets
-ast.annotation:leaf("Set", {"cuda", "external", "inline", "inner", "leaf",
-                            "openmp", "optimize", "parallel", "spmd", "trace",
-                            "vectorize"},
+ast.annotation:leaf("Set", {"cuda", "external", "idempotent", "inline",
+                            "inner", "leaf", "openmp", "optimize", "parallel", 
+                            "replicable", "spmd", "trace", "vectorize"},
                     false, true)
 
 function ast.default_annotations()
@@ -115,12 +115,14 @@ function ast.default_annotations()
   return ast.annotation.Set {
     cuda = allow,
     external = allow,
+    idempotent = allow,
     inline = allow,
     inner = allow,
     leaf = allow,
     openmp = allow,
     optimize = allow,
     parallel = allow,
+    replicable = allow,
     spmd = allow,
     trace = allow,
     vectorize = allow,
@@ -183,6 +185,13 @@ ast.constraint:leaf("Constraint", {"lhs", "rhs", "op"})
 
 ast:inner("privilege")
 ast.privilege:leaf("Privilege", {"privilege", "region", "field_path"})
+
+-- Layout Constraints
+
+ast:inner("layout")
+ast.layout:leaf("Dim", {"index"}):set_memoize()
+ast.layout:leaf("Field", {"region_name", "field_paths"})
+ast.layout:leaf("Ordering", {"dimensions"})
 
 -- Node Types (Unspecialized)
 
@@ -293,6 +302,7 @@ ast.unspecialized.stat:leaf("Escape", {"expr"})
 ast.unspecialized.stat:leaf("RawDelete", {"value"})
 ast.unspecialized.stat:leaf("Fence", {"kind", "blocking"})
 ast.unspecialized.stat:leaf("ParallelizeWith", {"hints", "block"})
+ast.unspecialized.stat:leaf("ParallelPrefix", {"lhs", "rhs", "op", "dir"})
 
 ast.unspecialized:inner("top", {"annotations"})
 ast.unspecialized.top:leaf("Task", {"name", "params", "return_type_expr",
@@ -412,6 +422,7 @@ ast.specialized.stat:leaf("Expr", {"expr"})
 ast.specialized.stat:leaf("RawDelete", {"value"})
 ast.specialized.stat:leaf("Fence", {"kind", "blocking"})
 ast.specialized.stat:leaf("ParallelizeWith", {"hints", "block"})
+ast.specialized.stat:leaf("ParallelPrefix", {"lhs", "rhs", "op", "dir"})
 
 ast.specialized:inner("top", {"annotations"})
 ast.specialized.top:leaf("Task", {"name", "params", "return_type",
@@ -530,12 +541,13 @@ ast.typed.stat:leaf("Expr", {"expr"})
 ast.typed.stat:leaf("RawDelete", {"value"})
 ast.typed.stat:leaf("Fence", {"kind", "blocking"})
 ast.typed.stat:leaf("ParallelizeWith", {"hints", "block"})
+ast.typed.stat:leaf("ParallelPrefix", {"lhs", "rhs", "op", "dir"})
 ast.typed.stat:leaf("BeginTrace", {"trace_id"})
 ast.typed.stat:leaf("EndTrace", {"trace_id"})
 ast.typed.stat:leaf("MapRegions", {"region_types"})
 ast.typed.stat:leaf("UnmapRegions", {"region_types"})
 
-ast:leaf("TaskConfigOptions", {"leaf", "inner", "idempotent"})
+ast:leaf("TaskConfigOptions", {"leaf", "inner", "idempotent", "replicable"})
 
 ast.typed:inner("top", {"annotations"})
 ast.typed.top:leaf("Fspace", {"name", "fspace"})

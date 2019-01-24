@@ -63,11 +63,11 @@
 
 // The maximum number of nodes to be run on
 #ifndef MAX_NUM_NODES
-#define MAX_NUM_NODES                   1024
+#define MAX_NUM_NODES                   1024 // must be a power of 2
 #endif
 // The maximum number of processors on a node
 #ifndef MAX_NUM_PROCS
-#define MAX_NUM_PROCS                   64
+#define MAX_NUM_PROCS                   64 // must be a power of 2
 #endif
 // Maximum ID for an application task ID 
 #ifndef MAX_APPLICATION_TASK_ID
@@ -84,6 +84,10 @@
 // Maximum ID for an application projection ID
 #ifndef MAX_APPLICATION_PROJECTION_ID
 #define MAX_APPLICATION_PROJECTION_ID   (1<<20)
+#endif
+// Maximum ID for an application sharding ID
+#ifndef MAX_APPLICATION_SHARDING_ID
+#define MAX_APPLICATION_SHARDING_ID     (1<<20)
 #endif
 // Default number of local fields per field space
 #ifndef DEFAULT_LOCAL_FIELDS
@@ -115,6 +119,10 @@
 // How many tasks to group together for runtime operations
 #ifndef DEFAULT_META_TASK_VECTOR_WIDTH
 #define DEFAULT_META_TASK_VECTOR_WIDTH  16
+#endif
+// Default number of replay tasks to run in parallel
+#ifndef DEFAULT_MAX_REPLAY_PARALLELISM
+#define DEFAULT_MAX_REPLAY_PARALLELISM  2
 #endif
 // The maximum size of active messages sent by the runtime in bytes
 // Note this value was picked based on making a tradeoff between
@@ -182,6 +190,11 @@
 // Maximum depth of composite instances before warnings
 #ifndef LEGION_PRUNE_DEPTH_WARNING
 #define LEGION_PRUNE_DEPTH_WARNING        8
+#endif
+
+// Maximum number of non-replayable templates before warnings
+#ifndef LEGION_NON_REPLAYABLE_WARNING
+#define LEGION_NON_REPLAYABLE_WARNING     5
 #endif
 
 // Initial offset for library IDs
@@ -530,8 +543,12 @@ typedef enum legion_error_t {
   ERROR_ILLEGAL_LEGION_END_TRACE = 471,
   ERROR_ILLEGAL_LEGION_BEGIN_STATIC_TRACE = 472,
   ERROR_ILLEGAL_LEGION_END_STATIC_TRACE = 473,
-  ERROR_PARENT_INDEX_PARTITION_REQUESTED = 477,
-  ERROR_FIELD_SPACE_HAS_NO_FIELD = 478,
+  ERROR_INVALID_PHYSICAL_TRACING = 474,
+  ERROR_INCOMPLETE_PHYSICAL_TRACING = 475,
+  ERROR_PHYSICAL_TRACING_UNSUPPORTED_OP = 476,
+  ERROR_PHYSICAL_TRACING_REMOTE_MAPPING = 477,
+  ERROR_PARENT_INDEX_PARTITION_REQUESTED = 478,
+  ERROR_FIELD_SPACE_HAS_NO_FIELD = 479,
   ERROR_PARENT_LOGICAL_PARTITION_REQUESTED = 480,
   ERROR_INVALID_REQUEST_FOR_INDEXSPACE = 481,
   ERROR_UNABLE_FIND_ENTRY = 482,
@@ -562,6 +579,11 @@ typedef enum legion_error_t {
   ERROR_NON_DENSE_RECTANGLE = 548,
   ERROR_LIBRARY_COUNT_MISMATCH = 549, 
   ERROR_MPI_INTEROP_MISCONFIGURATION = 550,
+  ERROR_NUMBER_SRC_INDIRECT_REQUIREMENTS = 551,
+  ERROR_NUMBER_DST_INDIRECT_REQUIREMENTS = 552,
+  ERROR_COPY_GATHER_REQUIREMENT = 553,
+  ERROR_COPY_SCATTER_REQUIREMENT = 554,
+  ERROR_MAPPER_SYNCHRONIZATION = 555,
   
 
   LEGION_WARNING_FUTURE_NONLEAF = 1000,
@@ -614,6 +636,7 @@ typedef enum legion_error_t {
   LEGION_WARNING_EXTERNAL_ATTACH_OPERATION = 1094,
   LEGION_WARNING_EXTERNAL_GARBAGE_PRIORITY = 1095,
   LEGION_WARNING_MAPPER_INVALID_INSTANCE = 1096,
+  LEGION_WARNING_NON_REPLAYABLE_COUNT_EXCEEDED = 1097,
   
   
   LEGION_FATAL_MUST_EPOCH_NOADDRESS = 2000,
@@ -662,11 +685,19 @@ typedef enum legion_coherence_property_t {
 
 // Optional region requirement flags
 typedef enum legion_region_flags_t {
-  NO_FLAG         = 0x00000000,
-  VERIFIED_FLAG   = 0x00000001,
-  NO_ACCESS_FLAG  = 0x00000002, // Deprecated, user SpecializedConstraint
-  RESTRICTED_FLAG = 0x00000004,
-  MUST_PREMAP_FLAG= 0x00000008,
+  NO_FLAG             = 0x00000000,
+  VERIFIED_FLAG       = 0x00000001,
+  NO_ACCESS_FLAG      = 0x00000002, // Deprecated, user SpecializedConstraint
+  RESTRICTED_FLAG     = 0x00000004,
+  MUST_PREMAP_FLAG    = 0x00000008,
+  // For non-trivial projection functions: 
+  // tell the runtime the write is complete,
+  // will be ignored for non-index space launches
+  // and for privileges that aren't WRITE
+  // Note that if you use this incorrectly it could
+  // break the correctness of your code so be sure
+  // you know what you are doing
+  COMPLETE_PROJECTION_WRITE_FLAG = 0x00000010,
 } legion_region_flags_t;
 
 typedef enum legion_projection_type_t {
@@ -860,9 +891,12 @@ typedef unsigned int legion_field_space_id_t;
 typedef unsigned int legion_generation_id_t;
 typedef unsigned int legion_type_handle;
 typedef unsigned int legion_projection_id_t;
+typedef unsigned int legion_sharding_id_t;
 typedef unsigned int legion_region_tree_id_t;
 typedef unsigned int legion_tunable_id_t;
 typedef unsigned int legion_local_variable_id_t;
+typedef unsigned int legion_replication_id_t;
+typedef unsigned int legion_shard_id_t;
 typedef unsigned long long legion_distributed_id_t;
 typedef unsigned long legion_mapping_tag_id_t;
 typedef unsigned long legion_variant_id_t;

@@ -29,11 +29,11 @@ USE_SPY         ?= 0    # Include detailed Legion Spy support
 # Put the binary file name here
 OUTFILE		?= libregent.so
 # List all the application source files here
-GEN_SRC		?= legion_terra.cc legion_terra_partitions.cc bishop_mapper.cc bishop_c.cc # .cc files
+GEN_SRC		?= regent.cc regent_partitions.cc bishop_mapper.cc bishop_c.cc murmur_hash3.cc # .cc files
 GEN_GPU_SRC	?=		# .cu files
 
 ifeq ($(strip $(USE_CUDA)),1)
-GEN_SRC += legion_terra_cudart_hijack.cc
+GEN_SRC += regent_cudart_hijack.cc
 endif
 
 CC_FLAGS ?= #-DPROF_BINDING #-DBOUNDS_CHECKS #-DLEGION_SPY

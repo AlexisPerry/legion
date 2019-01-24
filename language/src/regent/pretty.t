@@ -282,9 +282,8 @@ function pretty.expr_function(cx, node)
     name = 'vector'
   elseif node.value == _G['tuple'] then
     name = 'tuple'
-  elseif regentlib.is_math_op(node.value) then
-    -- HACK: This information should be exported from std.t
-    name = regentlib.get_math_op_name(node.value, node.expr_type.returntype)
+  elseif regentlib.is_math_fn(node.value) then
+    name = node.value:printpretty()
   else
     name = tostring(node.value)
   end
@@ -1144,6 +1143,16 @@ function pretty.stat_parallelize_with(cx, node)
   return text.Lines { lines = result }
 end
 
+function pretty.stat_parallel_prefix(cx, node)
+  local result = terralib.newlist()
+  result:insert(pretty.annotations(cx, node.annotations))
+  result:insert(join({"__parallel_prefix(",
+    commas({pretty.expr_region_root(cx, node.lhs),
+            pretty.expr_region_root(cx, node.rhs),
+            node.op, pretty.expr(cx, node.dir)}), ")"}))
+  return text.Lines { lines = result }
+end
+
 function pretty.stat(cx, node)
   if node:is(ast.typed.stat.If) then
     return pretty.stat_if(cx, node)
@@ -1219,6 +1228,9 @@ function pretty.stat(cx, node)
 
   elseif node:is(ast.typed.stat.ParallelizeWith) then
     return pretty.stat_parallelize_with(cx, node)
+
+  elseif node:is(ast.typed.stat.ParallelPrefix) then
+    return pretty.stat_parallel_prefix(cx, node)
 
   else
     assert(false, "unexpected node type " .. tostring(node:type()))
@@ -1305,6 +1317,7 @@ function pretty.task_config_options(cx, node)
       join({"leaf (", tostring(node.leaf), ")"}),
       join({"inner (", tostring(node.inner), ")"}),
       join({"idempotent (", tostring(node.idempotent), ")"}),
+      join({"replicable (", tostring(node.replicable), ")"}),
   })
 end
 

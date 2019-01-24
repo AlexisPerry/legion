@@ -44,6 +44,14 @@ namespace Legion {
       typedef Legion::UnsafeFieldAccessor<char,3,coord_t,
                 Realm::AffineAccessor<char,3,coord_t> >   ArrayAccessor3D;
 
+      typedef RectInDomainIterator<1,coord_t>  RectInDomainIterator1D;
+      typedef RectInDomainIterator<2,coord_t>  RectInDomainIterator2D;
+      typedef RectInDomainIterator<3,coord_t>  RectInDomainIterator3D;
+
+      typedef DeferredBuffer<char,1> DeferredBufferChar1D;
+      typedef DeferredBuffer<char,2> DeferredBufferChar2D;
+      typedef DeferredBuffer<char,3> DeferredBufferChar3D;
+
 #ifdef __ICC
 // icpc complains about "error #858: type qualifier on return type is meaningless"
 // but it's pretty annoying to get this macro to handle all the cases right
@@ -71,6 +79,9 @@ namespace Legion {
       NEW_OPAQUE_WRAPPER(legion_runtime_t, Runtime *);
       NEW_OPAQUE_WRAPPER(legion_context_t, CContext *);
       NEW_OPAQUE_WRAPPER(legion_domain_point_iterator_t, Domain::DomainPointIterator *);
+      NEW_OPAQUE_WRAPPER(legion_rect_in_domain_iterator_1d_t, RectInDomainIterator1D *);
+      NEW_OPAQUE_WRAPPER(legion_rect_in_domain_iterator_2d_t, RectInDomainIterator2D *);
+      NEW_OPAQUE_WRAPPER(legion_rect_in_domain_iterator_3d_t, RectInDomainIterator3D *);
       NEW_OPAQUE_WRAPPER(legion_coloring_t, Coloring *);
       NEW_OPAQUE_WRAPPER(legion_domain_coloring_t, DomainColoring *);
       NEW_OPAQUE_WRAPPER(legion_point_coloring_t, PointColoring *);
@@ -82,6 +93,9 @@ namespace Legion {
       NEW_OPAQUE_WRAPPER(legion_predicate_t, Predicate *);
       NEW_OPAQUE_WRAPPER(legion_future_t, Future *);
       NEW_OPAQUE_WRAPPER(legion_future_map_t, FutureMap *);
+      NEW_OPAQUE_WRAPPER(legion_deferred_buffer_char_1d_t, DeferredBufferChar1D *);
+      NEW_OPAQUE_WRAPPER(legion_deferred_buffer_char_2d_t, DeferredBufferChar2D *);
+      NEW_OPAQUE_WRAPPER(legion_deferred_buffer_char_3d_t, DeferredBufferChar3D *);
       NEW_OPAQUE_WRAPPER(legion_task_launcher_t, TaskLauncher *);
       NEW_OPAQUE_WRAPPER(legion_index_launcher_t, IndexTaskLauncher *);
       NEW_OPAQUE_WRAPPER(legion_inline_launcher_t, InlineLauncher *);
@@ -630,6 +644,9 @@ namespace Legion {
         options_.inline_task = options.inline_task;
         options_.stealable = options.stealable;
         options_.map_locally = options.map_locally;
+        options_.valid_instances = options.valid_instances;
+        options_.memoize = options.memoize;
+        options_.replicate = options.replicate;
         options_.parent_priority = options.parent_priority;
         return options_;
       }
@@ -641,6 +658,9 @@ namespace Legion {
         options.inline_task = options_.inline_task;
         options.stealable = options_.stealable;
         options.map_locally = options_.map_locally;
+        options.valid_instances = options_.valid_instances;
+        options.memoize = options_.memoize;
+        options.replicate = options_.replicate;
         options.parent_priority = options_.parent_priority;
         return options;
       }

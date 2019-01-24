@@ -713,9 +713,14 @@ namespace Realm {
 	      assert(dst_info.num_lines == 1);
 	      assert(dst_info.num_planes == 1);
 	    } else {
+	      // track how much of src and/or dst is "lost" into a 4th
+	      //  dimension
+	      size_t src_4d_factor = 1;
+	      size_t dst_4d_factor = 1;
 	      if(src_info.bytes_per_chunk < dst_info.bytes_per_chunk) {
 		size_t ratio = dst_info.bytes_per_chunk / src_info.bytes_per_chunk;
 		assert((src_info.bytes_per_chunk * ratio) == dst_info.bytes_per_chunk);
+		dst_4d_factor *= dst_info.num_planes; // existing planes lost
 		dst_info.num_planes = dst_info.num_lines;
 		dst_info.plane_stride = dst_info.line_stride;
 		dst_info.num_lines = ratio;
@@ -725,6 +730,7 @@ namespace Realm {
 	      if(dst_info.bytes_per_chunk < src_info.bytes_per_chunk) {
 		size_t ratio = src_info.bytes_per_chunk / dst_info.bytes_per_chunk;
 		assert((dst_info.bytes_per_chunk * ratio) == src_info.bytes_per_chunk);
+		src_4d_factor *= src_info.num_planes; // existing planes lost
 		src_info.num_planes = src_info.num_lines;
 		src_info.plane_stride = src_info.line_stride;
 		src_info.num_lines = ratio;
@@ -737,6 +743,7 @@ namespace Realm {
 	      if(src_info.num_lines < dst_info.num_lines) {
 		size_t ratio = dst_info.num_lines / src_info.num_lines;
 		assert((src_info.num_lines * ratio) == dst_info.num_lines);
+		dst_4d_factor *= dst_info.num_planes; // existing planes lost
 		dst_info.num_planes = ratio;
 		dst_info.plane_stride = dst_info.line_stride * src_info.num_lines;
 		dst_info.num_lines = src_info.num_lines;
@@ -744,6 +751,7 @@ namespace Realm {
 	      if(dst_info.num_lines < src_info.num_lines) {
 		size_t ratio = src_info.num_lines / dst_info.num_lines;
 		assert((dst_info.num_lines * ratio) == src_info.num_lines);
+		src_4d_factor *= src_info.num_planes; // existing planes lost
 		src_info.num_planes = ratio;
 		src_info.plane_stride = src_info.line_stride * dst_info.num_lines;
 		src_info.num_lines = dst_info.num_lines;
@@ -752,8 +760,16 @@ namespace Realm {
 	      // sanity-checks: src/dst should match on lines/planes and we
 	      //  shouldn't have multiple planes if we don't have multiple lines
 	      assert(src_info.num_lines == dst_info.num_lines);
-	      assert(src_info.num_planes == dst_info.num_planes);
+	      assert((src_info.num_planes * src_4d_factor) == 
+		     (dst_info.num_planes * dst_4d_factor));
 	      assert((src_info.num_lines > 1) || (src_info.num_planes == 1));
+	      assert((dst_info.num_lines > 1) || (dst_info.num_planes == 1));
+
+	      // only do as many planes as both src and dst can manage
+	      if(src_info.num_planes > dst_info.num_planes)
+		src_info.num_planes = dst_info.num_planes;
+	      else
+		dst_info.num_planes = src_info.num_planes;
 
 	      // if 3D isn't allowed, set num_planes back to 1
 	      if((flags & TransferIterator::PLANES_OK) == 0) {
@@ -1803,6 +1819,10 @@ namespace Realm {
 	  // always ask the HDF5 size for a step first
 	  size_t hdf5_bytes = hdf5_iter->step(max_bytes, hdf5_info,
 					      true /*tentative*/);
+          if(hdf5_bytes == 0) {
+            // not enough space for even a single element - try again later
+            break;
+          }
 	  // TODO: support 2D/3D for memory side of an HDF transfer?
 	  size_t mem_bytes = mem_iter->step(hdf5_bytes, mem_info, 0);
 	  if(mem_bytes == hdf5_bytes) {
@@ -2264,7 +2284,8 @@ namespace Realm {
 
       static const Memory::Kind cpu_mem_kinds[] = { Memory::SYSTEM_MEM,
 						    Memory::REGDMA_MEM,
-						    Memory::Z_COPY_MEM };
+						    Memory::Z_COPY_MEM,
+                                                    Memory::SOCKET_MEM };
       static const size_t num_cpu_mem_kinds = sizeof(cpu_mem_kinds) / sizeof(cpu_mem_kinds[0]);
 
       MemcpyChannel::MemcpyChannel(long max_nr)
@@ -2279,7 +2300,7 @@ namespace Realm {
         //cbs = (MemcpyRequest**) calloc(max_nr, sizeof(MemcpyRequest*));
 	unsigned bw = 0; // TODO
 	unsigned latency = 0;
-	// any combination of SYSTEM/REGDMA/Z_COPY_MEM
+	// any combination of SYSTEM/REGDMA/Z_COPY/SOCKET_MEM
 	for(size_t i = 0; i < num_cpu_mem_kinds; i++)
 	  for(size_t j = 0; j < num_cpu_mem_kinds; j++)
 	    add_path(cpu_mem_kinds[i], false,
@@ -2837,7 +2858,7 @@ namespace Realm {
 
 	unsigned bw = 0; // TODO
 	unsigned latency = 0;
-	// any combination of SYSTEM/REGDMA/Z_COPY_MEM
+	// any combination of SYSTEM/REGDMA/Z_COPY/SOCKET_MEM
 	for(size_t i = 0; i < num_cpu_mem_kinds; i++)
 	  if(_kind == XferDes::XFER_GASNET_READ)
 	    add_path(Memory::GLOBAL_MEM, true,
@@ -2898,7 +2919,7 @@ namespace Realm {
 
 	unsigned bw = 0; // TODO
 	unsigned latency = 0;
-	// any combination of SYSTEM/REGDMA/Z_COPY_MEM
+	// any combination of SYSTEM/REGDMA/Z_COPY/SOCKET_MEM
 	for(size_t i = 0; i < num_cpu_mem_kinds; i++)
 	  add_path(cpu_mem_kinds[i], false,
 		   Memory::REGDMA_MEM, true,

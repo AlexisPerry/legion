@@ -37,7 +37,8 @@ namespace Realm {
   class LocalNumaProcessor : public LocalTaskProcessor {
   public:
     LocalNumaProcessor(Processor _me, int _numa_node,
-		       CoreReservationSet& crs, size_t _stack_size);
+		       CoreReservationSet& crs, size_t _stack_size,
+		       bool _force_kthreads);
     virtual ~LocalNumaProcessor(void);
   protected:
     int numa_node;
@@ -46,7 +47,8 @@ namespace Realm {
 
   LocalNumaProcessor::LocalNumaProcessor(Processor _me, int _numa_node,
 					 CoreReservationSet& crs,
-					 size_t _stack_size)
+					 size_t _stack_size,
+					 bool _force_kthreads)
     : LocalTaskProcessor(_me, Processor::LOC_PROC)
     , numa_node(_numa_node)
   {
@@ -63,13 +65,17 @@ namespace Realm {
     core_rsrv = new CoreReservation(name, crs, params);
 
 #ifdef REALM_USE_USER_THREADS
-    UserThreadTaskScheduler *sched = new UserThreadTaskScheduler(me, *core_rsrv);
-    // no config settings we want to tweak yet
-#else
-    KernelThreadTaskScheduler *sched = new KernelThreadTaskScheduler(me, *core_rsrv);
-    sched->cfg_max_idle_workers = 3; // keep a few idle threads around
+    if(!_force_kthreads) {
+      UserThreadTaskScheduler *sched = new UserThreadTaskScheduler(me, *core_rsrv);
+      // no config settings we want to tweak yet
+      set_scheduler(sched);
+    } else
 #endif
-    set_scheduler(sched);
+    {
+      KernelThreadTaskScheduler *sched = new KernelThreadTaskScheduler(me, *core_rsrv);
+      sched->cfg_max_idle_workers = 3; // keep a few idle threads around
+      set_scheduler(sched);
+    }
   }
 
   LocalNumaProcessor::~LocalNumaProcessor(void)
@@ -229,6 +235,8 @@ namespace Realm {
 	Memory m = runtime->next_local_memory_id();
 	LocalCPUMemory *numamem = new LocalCPUMemory(m,
 						     mem_size,
+                                                     it->first/*numa node*/,
+                                                     Memory::SOCKET_MEM,
 						     base_ptr,
 						     false /*!registered*/);
 	runtime->add_memory(numamem);
@@ -251,7 +259,8 @@ namespace Realm {
 	  Processor p = runtime->next_local_processor_id();
 	  ProcessorImpl *pi = new LocalNumaProcessor(p, it->first,
 						     runtime->core_reservation_set(),
-						     cfg_stack_size_in_mb << 20);
+						     cfg_stack_size_in_mb << 20,
+						     Config::force_kernel_threads);
 	  runtime->add_processor(pi);
 
 	  // create affinities between this processor and system/reg memories
@@ -262,34 +271,19 @@ namespace Realm {
 	      it2 != local_mems.end();
 	      ++it2) {
 	    Memory::Kind kind = (*it2)->get_kind();
-	    if((kind != Memory::SYSTEM_MEM) && (kind != Memory::REGDMA_MEM))
+	    if((kind != Memory::SYSTEM_MEM) && (kind != Memory::REGDMA_MEM) &&
+               (kind != Memory::SOCKET_MEM) && (kind != Memory::Z_COPY_MEM))
 	      continue;
 
 	    Machine::ProcessorMemoryAffinity pma;
 	    pma.p = p;
 	    pma.m = (*it2)->me;
 
-	    int mem_node = -1;
-	    for(std::map<int, MemoryImpl *>::const_iterator it3 = memories.begin();
-		it3 != memories.end();
-		++it3)
-	      if(it3->second == *it2) {
-		mem_node = it3->first;
-		break;
-	      }
-
-	    if(mem_node == -1) {
-	      // not one of our memories - use the same made-up numbers as in
-	      //  runtime_impl.cc
-	      if(kind == Memory::SYSTEM_MEM) {
-		pma.bandwidth = 100;  // "large"
-		pma.latency = 5;      // "small"
-	      } else {
-		pma.bandwidth = 80;   // "large"
-		pma.latency = 10;     // "small"
-	      }
-	    } else {
-	      int d = numasysif_get_distance(cpu_node, mem_node);
+            if (kind == Memory::SOCKET_MEM) {
+              LocalCPUMemory *cpu_mem = static_cast<LocalCPUMemory*>(*it2);
+              int mem_node = cpu_mem->numa_node;
+              assert(mem_node != -1);
+              int d = numasysif_get_distance(cpu_node, mem_node);
 	      if(d >= 0) {
 		pma.bandwidth = 150 - d;
 		pma.latency = d / 10;     // Linux uses a cost of ~10/hop
@@ -298,7 +292,19 @@ namespace Realm {
 		pma.bandwidth = 100;
 		pma.latency = 5;
 	      }
-	    }
+            } else if(kind == Memory::SYSTEM_MEM) {
+	      // not one of our memories - use the same made-up numbers as in
+	      //  runtime_impl.cc
+              pma.bandwidth = 100;  // "large"
+              pma.latency = 5;      // "small"
+            } else if (kind == Memory::Z_COPY_MEM) {
+              pma.bandwidth = 40; // "large"
+              pma.latency = 3; // "small"
+            } else {
+              // Regdma_mem
+              pma.bandwidth = 80;   // "large"
+              pma.latency = 10;     // "small"
+            }
 	    
 	    runtime->add_proc_mem_affinity(pma);
 	  }

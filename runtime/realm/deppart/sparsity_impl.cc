@@ -159,10 +159,58 @@ namespace Realm {
 
   // call actual implementation - inlining makes this cheaper than a virtual method
   template <int N, typename T>
-  __attribute__ ((noinline))
   Event SparsityMapPublicImpl<N,T>::make_valid(bool precise /*= true*/)
   {
     return static_cast<SparsityMapImpl<N,T> *>(this)->make_valid(precise);
+  }
+
+  // membership test between two (presumably-different) sparsity maps are not
+  //  cheap - try bounds-based checks first (see IndexSpace::overlaps)
+  template <int N, typename T>
+  bool SparsityMapPublicImpl<N,T>::overlaps(SparsityMapPublicImpl<N,T> *other,
+					    const Rect<N,T>& bounds,
+					    bool approx)
+  {
+    // full cross-product test for now - for larger rectangle lists, consider
+    //  an acceleration structure?
+    if(approx) {
+      const std::vector<Rect<N,T> >& rects1 = get_approx_rects();
+      const std::vector<Rect<N,T> >& rects2 = other->get_approx_rects();
+      for(typename std::vector<Rect<N,T> >::const_iterator it1 = rects1.begin();
+	  it1 != rects1.end();
+	  it1++) {
+	Rect<N,T> isect = it1->intersection(bounds);
+	if(isect.empty())
+	  continue;
+	for(typename std::vector<Rect<N,T> >::const_iterator it2 = rects2.begin();
+	    it2 != rects2.end();
+	    it2++) {
+	  if(it2->overlaps(isect))
+	    return true;
+	}
+      }
+    } else {
+      const std::vector<SparsityMapEntry<N,T> >& entries1 = get_entries();
+      const std::vector<SparsityMapEntry<N,T> >& entries2 = other->get_entries();
+      for(typename std::vector<SparsityMapEntry<N,T> >::const_iterator it1 = entries1.begin();
+	  it1 != entries1.end();
+	  it1++) {
+	Rect<N,T> isect = it1->bounds.intersection(bounds);
+	if(isect.empty())
+	  continue;
+	for(typename std::vector<SparsityMapEntry<N,T> >::const_iterator it2 = entries2.begin();
+	    it2 != entries2.end();
+	    it2++) {
+	  if(!it2->bounds.overlaps(isect)) continue;
+	  // TODO: handle further sparsity in either side
+	  assert(!it1->sparsity.exists() && (it1->bitmap == 0) &&
+		 !it2->sparsity.exists() && (it2->bitmap == 0));
+	  return true;
+	}
+      }
+    }
+
+    return false;
   }
 
 
@@ -962,69 +1010,10 @@ namespace Realm {
     Message::request(target, args);
   }
 
-
-  // instantiation stuff
-  namespace {
-    
-#define NT_INSTANTIATIONS(u, t)	      \
-    t((SparsityMapPublicImpl<N,T> *(SparsityMap<N,T>::*)(void) const),(&SparsityMap<N,T>::impl)) \
-    u((SparsityMapImpl<N,T>::lookup)) \
-    t((Event (SparsityMapPublicImpl<N,T>::*)(bool)),(&SparsityMapPublicImpl<N,T>::make_valid)) \
-    t((SparsityMap<N,T> (*)(const std::vector<Point<N,T> >&, bool)),(&SparsityMap<N,T>::construct)) \
-    t((SparsityMap<N,T> (*)(const std::vector<Rect<N,T> >&, bool)),(&SparsityMap<N,T>::construct)) \
-    t((bool (SparsityMapImpl<N,T>::*)(PartitioningMicroOp *, bool)),(&SparsityMapImpl<N,T>::add_waiter)) \
-    t((void (SparsityMapImpl<N,T>::*)(void)),(&SparsityMapImpl<N,T>::contribute_nothing))
-    
-    struct UntypedWrapper {
-      template <typename T>
-      static UntypedWrapper *wrap(T val);
-    };
-
-    template <typename T>
-    struct TypedWrapper : public UntypedWrapper {
-    public:
-      TypedWrapper(T _val) : val(_val) {}
-      T val;
-    };
-
-    template <typename T>
-    UntypedWrapper *UntypedWrapper::wrap(T val)
-    {
-      return new TypedWrapper<T>(val);
-    }
-
-    class NT_Instantiator {
-    public:
-      template <int N, typename T>
-      static void demux2(int tag, std::vector<void *> *v)
-      {
-#define UNWRAP(x) x
-#define UNTYPED(x) v->push_back(UntypedWrapper::wrap(&x));
-#define TYPED(t,x) v->push_back(UntypedWrapper::wrap(t x));
-	NT_INSTANTIATIONS(UNTYPED, TYPED);
-      }
-      template <typename NT, typename T>
-      static void demux(int tag, std::vector<void *> *v)
-      {
-	demux2<NT::N,T>(tag, v);
-      }
-    };
-
-    // use our dynamic template demux stuff to enumerate all possible
-    //  combinations of template paramters
-    void instantiate_stuff(int tag, std::vector<void *> *v)
-    {
-      NT_TemplateHelper::demux<NT_Instantiator>(tag, tag, v);
-      //NTF_TemplateHelper::demux<NTF_Instantiator>(tag, tag, v);
-      //NTNT_TemplateHelper::demux<NTNT_Instantiator>(tag, tag, v);
-    }
-  };
-
-  //void (*dummy)(void) __attribute__((unused)) = &InstantiatePartitioningStuff<1,int>::inst_stuff;
-  void (*dummy)(int, std::vector<void *> *) __attribute__((weak, unused)) = &instantiate_stuff;
-
 #define DOIT(N,T) \
-  template class SparsityMapImpl<N,T>;
+  template class SparsityMapPublicImpl<N,T>; \
+  template class SparsityMapImpl<N,T>; \
+  template class SparsityMap<N,T>;
   FOREACH_NT(DOIT)
 
 }; // namespace Realm

@@ -129,6 +129,7 @@ namespace Legion {
   class Close;
   class Fill;
   class Partition;
+  class MustEpoch;
   class Runtime;
   class MPILegionHandshake;
   // For backwards compatibility
@@ -335,6 +336,8 @@ namespace Legion {
       LG_TIGHTEN_INDEX_SPACE_TASK_ID,
       LG_REMOTE_PHYSICAL_REQUEST_TASK_ID,
       LG_REMOTE_PHYSICAL_RESPONSE_TASK_ID,
+      LG_REPLAY_SLICE_ID,
+      LG_DELETE_TEMPLATE_ID,
       LG_MESSAGE_ID, // These two must be the last two
       LG_RETRY_SHUTDOWN_TASK_ID,
       LG_LAST_TASK_ID, // This one should always be last
@@ -420,6 +423,8 @@ namespace Legion {
         "Tighten Index Space",                                    \
         "Remote Physical Context Request",                        \
         "Remote Physical Context Response",                       \
+        "Replay Physical Trace",                                  \
+        "Delete Physical Template",                               \
         "Remote Message",                                         \
         "Retry Shutdown",                                         \
       };
@@ -467,6 +472,7 @@ namespace Legion {
       SELECT_TUNABLE_VALUE_CALL,
       MAP_MUST_EPOCH_CALL,
       MAP_DATAFLOW_GRAPH_CALL,
+      MEMOIZE_OPERATION_CALL,
       SELECT_TASKS_TO_MAP_CALL,
       SELECT_STEAL_TARGETS_CALL,
       PERMIT_STEAL_REQUEST_CALL,
@@ -519,6 +525,7 @@ namespace Legion {
       "select_tunable_value",                       \
       "map_must_epoch",                             \
       "map_dataflow_graph",                         \
+      "memoize_operation",                          \
       "select_tasks_to_map",                        \
       "select_steal_targets",                       \
       "permit_steal_request",                       \
@@ -606,6 +613,7 @@ namespace Legion {
       SEND_INDEX_PARTITION_RETURN,
       SEND_INDEX_PARTITION_CHILD_REQUEST,
       SEND_INDEX_PARTITION_CHILD_RESPONSE,
+      SEND_INDEX_PARTITION_DISJOINT_UPDATE,
       SEND_FIELD_SPACE_NODE,
       SEND_FIELD_SPACE_REQUEST,
       SEND_FIELD_SPACE_RETURN,
@@ -712,7 +720,6 @@ namespace Legion {
       SEND_CONSTRAINT_REQUEST,
       SEND_CONSTRAINT_RESPONSE,
       SEND_CONSTRAINT_RELEASE,
-      SEND_CONSTRAINT_REMOVAL,
       SEND_TOP_LEVEL_TASK_REQUEST,
       SEND_TOP_LEVEL_TASK_COMPLETE,
       SEND_MPI_RANK_EXCHANGE,
@@ -746,6 +753,7 @@ namespace Legion {
         "Send Index Partition Return",                                \
         "Send Index Partition Child Request",                         \
         "Send Index Partition Child Response",                        \
+        "Send Index Partition Disjoint Update",                       \
         "Send Field Space Node",                                      \
         "Send Field Space Request",                                   \
         "Send Field Space Return",                                    \
@@ -852,7 +860,6 @@ namespace Legion {
         "Send Constraint Request",                                    \
         "Send Constraint Response",                                   \
         "Send Constraint Release",                                    \
-        "Send Constraint Removal",                                    \
         "Top Level Task Request",                                     \
         "Top Level Task Complete",                                    \
         "Send MPI Rank Exchange",                                     \
@@ -1020,6 +1027,9 @@ namespace Legion {
       REDUCTION_VIEW_FIND_COPY_PRECONDITIONS_CALL,
       REDUCTION_VIEW_FIND_USER_PRECONDITIONS_CALL,
       REDUCTION_VIEW_FILTER_LOCAL_USERS_CALL,
+      PHYSICAL_TRACE_EXECUTE_CALL,
+      PHYSICAL_TRACE_PRECONDITION_CHECK_CALL,
+      PHYSICAL_TRACE_OPTIMIZE_CALL,
       LAST_RUNTIME_CALL_KIND, // This one must be last
     };
 
@@ -1178,6 +1188,9 @@ namespace Legion {
       "Reduction View Find Copy Preconditions",                       \
       "Reduction View Find User Preconditions",                       \
       "Reduction View Filter Local Users",                            \
+      "Physical Trace Execute",                                       \
+      "Physical Trace Precondition Check",                            \
+      "Physical Trace Optimize",                                      \
     };
 
     enum SemanticInfoKind {
@@ -1346,7 +1359,7 @@ namespace Legion {
     // One more nasty global variable that we use for tracking
     // the provenance of meta-task operations for profiling
     // purposes, this has no bearing on correctness
-    extern __thread ::legion_unique_id_t task_profiling_provenance;
+    extern __thread ::legion_unique_id_t implicit_provenance;
 
     /**
      * \class LgTaskArgs
@@ -1355,13 +1368,12 @@ namespace Legion {
     template<typename T>
     struct LgTaskArgs {
     public:
-      LgTaskArgs(void)
-        : lg_task_id(T::TASK_ID), provenance(task_profiling_provenance) { }
       LgTaskArgs(::legion_unique_id_t uid)
-        : lg_task_id(T::TASK_ID), provenance(uid) { }
+        : provenance(uid), lg_task_id(T::TASK_ID) { }
     public:
-      const LgTaskID lg_task_id;
+      // In this order for alignment reasons
       const ::legion_unique_id_t provenance;
+      const LgTaskID lg_task_id;
     };
     
     // legion_trace.h
@@ -1370,6 +1382,22 @@ namespace Legion {
     class DynamicTrace;
     class TraceCaptureOp;
     class TraceCompleteOp;
+    class TraceReplayOp;
+    class TraceBeginOp;
+    class TraceSummaryOp;
+    class PhysicalTrace;
+    struct PhysicalTemplate;
+    struct Instruction;
+    struct GetTermEvent;
+    struct CreateApUserEvent;
+    struct TriggerEvent;
+    struct MergeEvent;
+    struct AssignFenceCompletion;
+    struct IssueCopy;
+    struct IssueFill;
+    struct GetOpTermEvent;
+    struct SetOpSyncEvent;
+    struct CompleteReplay;
 
     // region_tree.h
     class RegionTreeForest;
@@ -1437,7 +1465,8 @@ namespace Legion {
     struct GenericUser;
     struct LogicalUser;
     struct PhysicalUser;
-    struct TraceInfo;
+    struct LogicalTraceInfo;
+    struct PhysicalTraceInfo;
     class ClosedNode;
     class LogicalCloser;
     class TreeCloseImpl;
@@ -1500,6 +1529,7 @@ namespace Legion {
     friend class Internal::AttachOp;                        \
     friend class Internal::DetachOp;                        \
     friend class Internal::TimingOp;                        \
+    friend class Internal::TraceSummaryOp;                  \
     friend class Internal::ExternalTask;                    \
     friend class Internal::TaskOp;                          \
     friend class Internal::SingleTask;                      \
@@ -1602,6 +1632,7 @@ namespace Legion {
   typedef ::legion_generation_id_t GenerationID;
   typedef ::legion_type_handle TypeHandle;
   typedef ::legion_projection_id_t ProjectionID;
+  typedef ::legion_sharding_id_t ShardingID;
   typedef ::legion_region_tree_id_t RegionTreeID;
   typedef ::legion_distributed_id_t DistributedID;
   typedef ::legion_address_space_t AddressSpaceID;
@@ -1616,6 +1647,8 @@ namespace Legion {
   typedef ::legion_projection_epoch_id_t ProjectionEpochID;
   typedef ::legion_task_id_t TaskID;
   typedef ::legion_layout_constraint_id_t LayoutConstraintID;
+  typedef ::legion_replication_id_t ReplicationID;
+  typedef ::legion_shard_id_t ShardID;
   typedef ::legion_internal_color_t LegionColor;
   typedef void (*RegistrationCallbackFnptr)(Machine machine, 
                 Runtime *rt, const std::set<Processor> &local_procs);
@@ -2142,7 +2175,7 @@ namespace Legion {
       // Save the context locally
       Internal::TaskContext *local_ctx = Internal::implicit_context; 
       // Save the task provenance information
-      UniqueID local_provenance = Internal::task_profiling_provenance;
+      UniqueID local_provenance = Internal::implicit_provenance;
       // Check to see if we have any local locks to notify
       if (Internal::local_lock_list != NULL)
       {
@@ -2170,12 +2203,22 @@ namespace Legion {
       // Write the context back
       Internal::implicit_context = local_ctx;
       // Write the provenance information back
-      Internal::task_profiling_provenance = local_provenance;
+      Internal::implicit_provenance = local_provenance;
     }
 
 #ifdef LEGION_SPY
     // Need a custom version of these for Legion Spy to track instance events
-    struct CopySrcDstField : public Realm::CopySrcDstField {
+    class CopySrcDstField : public Realm::CopySrcDstField {
+    public:
+      CopySrcDstField(void) : Realm::CopySrcDstField() { }
+      CopySrcDstField(const CopySrcDstField &rhs)
+        : Realm::CopySrcDstField(rhs) { inst_event = rhs.inst_event; }
+      inline CopySrcDstField& operator=(const CopySrcDstField &rhs)
+      { 
+        Realm::CopySrcDstField::operator = (rhs); 
+        inst_event = rhs.inst_event; 
+        return *this; 
+      }
     public:
       ApEvent inst_event;
     };

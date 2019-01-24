@@ -91,7 +91,8 @@ local function convert_lua_value(cx, node, value, allow_lists)
   elseif terralib.isfunction(value) or
     terralib.isoverloadedfunction(value) or
     terralib.ismacro(value) or
-    terralib.types.istype(value) or std.is_task(value)
+    terralib.types.istype(value) or
+    std.is_task(value) or std.is_math_fn(value)
   then
     return ast.specialized.expr.Function {
       value = value,
@@ -587,6 +588,7 @@ function specialize.expr_call(cx, node, allow_lists)
     terralib.isoverloadedfunction(fn.value) or
     terralib.ismacro(fn.value) or
     std.is_task(fn.value) or
+    std.is_math_fn(fn.value) or
     type(fn.value) == "cdata"
   then
     if not std.is_task(fn.value) and #node.conditions > 0 then
@@ -1674,9 +1676,26 @@ function specialize.stat_parallelize_with(cx, node)
     end
     return hint
   end)
+
+  local cx = cx:new_local_scope()
   return ast.specialized.stat.ParallelizeWith {
     hints = hints,
     block = specialize.block(cx, node.block),
+    annotations = node.annotations,
+    span = node.span,
+  }
+end
+
+function specialize.stat_parallel_prefix(cx, node)
+  local lhs = specialize.expr_region_root(cx, node.lhs)
+  local rhs = specialize.expr_region_root(cx, node.rhs)
+  local op = node.op
+  local dir = specialize.expr(cx, node.dir)
+  return ast.specialized.stat.ParallelPrefix {
+    lhs = lhs,
+    rhs = rhs,
+    op = op,
+    dir = dir,
     annotations = node.annotations,
     span = node.span,
   }
@@ -1736,6 +1755,9 @@ function specialize.stat(cx, node)
 
   elseif node:is(ast.unspecialized.stat.ParallelizeWith) then
     return specialize.stat_parallelize_with(cx, node)
+
+  elseif node:is(ast.unspecialized.stat.ParallelPrefix) then
+    return specialize.stat_parallel_prefix(cx, node)
 
   else
     assert(false, "unexpected node type " .. tostring(node:type()))
@@ -1929,20 +1951,20 @@ end
 
 function specialize.top_quote_expr(cx, node)
   local cx = cx:new_local_scope(true)
-  return ast.specialized.top.QuoteExpr {
+  return std.newrquote(ast.specialized.top.QuoteExpr {
     expr = specialize.expr(cx, node.expr),
     annotations = node.annotations,
     span = node.span,
-  }
+  })
 end
 
 function specialize.top_quote_stat(cx, node)
   local cx = cx:new_local_scope(true)
-  return ast.specialized.top.QuoteStat {
+  return std.newrquote(ast.specialized.top.QuoteStat {
     block = specialize.block(cx, node.block),
     annotations = node.annotations,
     span = node.span,
-  }
+  })
 end
 
 function specialize.top(cx, node)

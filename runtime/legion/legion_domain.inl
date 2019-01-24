@@ -546,6 +546,17 @@ namespace Legion {
   }
 
   //----------------------------------------------------------------------------
+  template<int DIM, typename T>
+  inline DomainT<DIM,T>::operator Rect<DIM,T>(void) const
+  //----------------------------------------------------------------------------
+  {
+    // Can't convert to rect if we have a sparsity map
+    assert(this->dense());
+    const Rect<DIM,T> result = this->bounds;
+    return result;
+  }
+
+  //----------------------------------------------------------------------------
   inline DomainPoint::DomainPoint(void)
     : dim(0)
   //----------------------------------------------------------------------------
@@ -1233,6 +1244,18 @@ namespace Legion {
   }
 
   //----------------------------------------------------------------------------
+  inline Domain::DomainPointIterator::DomainPointIterator(
+                                                const DomainPointIterator &rhs)
+    : p(rhs.p), is_valid(rhs.is_valid), rect_valid(rhs.rect_valid)
+  //----------------------------------------------------------------------------
+  {
+    memcpy(is_iterator, rhs.is_iterator,
+      sizeof(Realm::IndexSpaceIterator<MAX_RECT_DIM,coord_t>));
+    memcpy(rect_iterator, rhs.rect_iterator,
+      sizeof(Realm::PointInRectIterator<MAX_RECT_DIM,coord_t>));
+  }
+
+  //----------------------------------------------------------------------------
   inline bool Domain::DomainPointIterator::step(void)
   //----------------------------------------------------------------------------
   {
@@ -1334,14 +1357,39 @@ namespace Legion {
   {
     return is_valid && rect_valid;
   }
+  
+  //----------------------------------------------------------------------------
+  inline Domain::DomainPointIterator& Domain::DomainPointIterator::operator=(
+                                                 const DomainPointIterator &rhs)
+  //----------------------------------------------------------------------------
+  {
+    p = rhs.p;
+    memcpy(is_iterator, rhs.is_iterator, 
+      sizeof(Realm::IndexSpaceIterator<MAX_RECT_DIM,coord_t>));
+    memcpy(rect_iterator, rhs.rect_iterator,
+      sizeof(Realm::PointInRectIterator<MAX_RECT_DIM,coord_t>));
+    is_valid = rhs.is_valid;
+    rect_valid = rhs.rect_valid;
+    return *this;
+  }
 
   //----------------------------------------------------------------------------
   inline Domain::DomainPointIterator& Domain::DomainPointIterator::operator++(
-                                                                 int/*postfix*/)
+                                                                          void)
   //----------------------------------------------------------------------------
   {
     step();
     return *this;
+  }
+
+  //----------------------------------------------------------------------------
+  inline Domain::DomainPointIterator Domain::DomainPointIterator::operator++(
+                                                                int/*postfix*/)
+  //----------------------------------------------------------------------------
+  {
+    Domain::DomainPointIterator result(*this);
+    step();
+    return result;
   }
 
   //----------------------------------------------------------------------------
@@ -1440,12 +1488,13 @@ namespace Legion {
 
   //----------------------------------------------------------------------------
   template<int DIM, typename COORD_T>
-  inline PointInRectIterator<DIM,COORD_T>&
+  inline PointInRectIterator<DIM,COORD_T>
                     PointInRectIterator<DIM,COORD_T>::operator++(int/*postfix*/)
   //----------------------------------------------------------------------------
   {
+    PointInRectIterator<DIM,COORD_T> result(*this);
     step();
-    return *this;
+    return result;
   }
 
   //----------------------------------------------------------------------------
@@ -1507,7 +1556,7 @@ namespace Legion {
   //----------------------------------------------------------------------------
   {
     current = itr.rect;
-    return current;
+    return &current;
   }
 
   //----------------------------------------------------------------------------
@@ -1522,12 +1571,13 @@ namespace Legion {
 
   //----------------------------------------------------------------------------
   template<int DIM, typename COORD_T>
-  inline RectInDomainIterator<DIM,COORD_T>&
+  inline RectInDomainIterator<DIM,COORD_T>
                    RectInDomainIterator<DIM,COORD_T>::operator++(int/*postfix*/)
   //----------------------------------------------------------------------------
   {
+    RectInDomainIterator<DIM,COORD_T> result(*this);
     step();
-    return *this;
+    return result;
   }
 
   //----------------------------------------------------------------------------
@@ -1622,12 +1672,13 @@ namespace Legion {
 
   //----------------------------------------------------------------------------
   template<int DIM, typename COORD_T>
-  inline PointInDomainIterator<DIM,COORD_T>&
+  inline PointInDomainIterator<DIM,COORD_T>
                   PointInDomainIterator<DIM,COORD_T>::operator++(int/*postfix*/)
   //----------------------------------------------------------------------------
   {
+    PointInDomainIterator<DIM,COORD_T> result(*this);
     step();
-    return *this;
+    return result;
   }
 
   //----------------------------------------------------------------------------

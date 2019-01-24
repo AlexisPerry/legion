@@ -16,14 +16,18 @@
 -- [
 --   ["pennant.tests/sedovsmall/sedovsmall.pnt",
 --    "-npieces", "1", "-seq_init", "1", "-par_init", "1", "-interior", "0",
+--    "-fflow-spmd", "1", "-fvectorize-unsafe", "1", "-ftrace", "0"],
+--   ["pennant.tests/sedov/sedov.pnt",
+--    "-npieces", "3", "-ll:cpu", "3", "-seq_init", "1", "-par_init", "1", "-interior", "0",
+--    "-absolute", "2e-6", "-relative", "1e-8", "-relative_absolute", "1e-10",
+--    "-fflow-spmd", "1", "-fvectorize-unsafe", "1", "-ftrace", "0"],
+--   ["pennant.tests/leblanc/leblanc.pnt",
+--    "-npieces", "2", "-ll:cpu", "2", "-seq_init", "1", "-par_init", "1", "-interior", "0",
 --    "-fflow-spmd", "1", "-fvectorize-unsafe", "1"],
 --   ["pennant.tests/sedov/sedov.pnt",
 --    "-npieces", "3", "-ll:cpu", "3", "-seq_init", "1", "-par_init", "1", "-interior", "0",
 --    "-absolute", "2e-6", "-relative", "1e-8", "-relative_absolute", "1e-10",
---    "-fflow-spmd", "1", "-fvectorize-unsafe", "1"],
---   ["pennant.tests/leblanc/leblanc.pnt",
---    "-npieces", "2", "-ll:cpu", "2", "-seq_init", "1", "-par_init", "1", "-interior", "0",
---    "-fflow-spmd", "1", "-fvectorize-unsafe", "1"]
+--    "-fflow-spmd", "1", "-fvectorize-unsafe", "1", "-dm:memoize"]
 -- ]
 
 -- Inspired by https://github.com/losalamos/PENNANT
@@ -134,7 +138,7 @@ where
   reads(rz_spans)
 do
   for z_span in rz_spans do
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for z_raw = z_span.start, z_span.stop do
       var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -338,19 +342,19 @@ do
   for p_span in rp_spans do
     -- Save off point variable values from previous cycle.
     -- Initialize fields used in reductions.
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for p_raw = p_span.start, p_span.stop do
       var p = unsafe_cast(ptr(point, rp), p_raw)
 
       p.pmaswt = 0.0
     end
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for p_raw = p_span.start, p_span.stop do
       var p = unsafe_cast(ptr(point, rp), p_raw)
 
       p.pf.x = 0.0
     end
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for p_raw = p_span.start, p_span.stop do
       var p = unsafe_cast(ptr(point, rp), p_raw)
 
@@ -362,7 +366,7 @@ do
     --
 
     -- Copy state variables from previous time step and update position.
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for p_raw = p_span.start, p_span.stop do
       var p = unsafe_cast(ptr(point, rp), p_raw)
 
@@ -372,7 +376,7 @@ do
       p.pu0.x = pu0_x
       p.pxp.x = px0_x + dth*pu0_x
     end
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for p_raw = p_span.start, p_span.stop do
       var p = unsafe_cast(ptr(point, rp), p_raw)
 
@@ -449,7 +453,7 @@ do
 
     -- Save off zone variable value from previous cycle.
     -- Copy state variables from previous time step.
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for z_raw = z_span.start, z_span.stop do
       var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -613,7 +617,7 @@ do
     --
 
     -- Compute zone densities.
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for z_raw = z_span.start, z_span.stop do
       var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -622,7 +626,7 @@ do
 
     -- Reduce masses into points.
     if s_span.internal then
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -634,7 +638,7 @@ do
         p1.pmaswt += m
       end
     else
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -656,7 +660,7 @@ do
       var ss2 = max(ssmin * ssmin, 1e-99)
       var dth = 0.5 * dt
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -683,7 +687,7 @@ do
     --
 
     -- Compute PolyGas and TTS forces.
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for s_raw = s_span.start, s_span.stop do
       var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -757,7 +761,7 @@ do
 
     -- QCS corner divergence.
     if s_span.internal then
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s2 = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -835,7 +839,7 @@ do
         c.cdu = cond3 * du
       end
     else
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s2 = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -918,7 +922,7 @@ do
     if s_span.internal then
       var gammap1 = gamma + 1.0
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s4 = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -945,7 +949,7 @@ do
     else
       var gammap1 = gamma + 1.0
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s4 = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -972,7 +976,7 @@ do
     end
 
     -- QCS force.
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for s_raw = s_span.start, s_span.stop do
       var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -999,14 +1003,14 @@ do
 
     -- QCS vel diff.
     if s_span.internal then
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
         z.z0tmp = 0.0
       end
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -1023,21 +1027,21 @@ do
         z.z0tmp max= dux
       end
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
         z.zdu = q1 * z.zss + 2.0 * q2 * z.z0tmp
       end
     else
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
         z.z0tmp = 0.0
       end
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -1054,7 +1058,7 @@ do
         z.z0tmp max= dux
       end
 
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -1064,7 +1068,7 @@ do
 
     -- Reduce forces into points.
     if s_span.internal then
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -1076,7 +1080,7 @@ do
         p1.pf.y += f.y
       end
     else
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for s_raw = s_span.start, s_span.stop do
         var s = unsafe_cast(ptr(side(rz, rpp, rpg, rs), rs), s_raw)
 
@@ -1111,7 +1115,7 @@ do
     -- 4a. Apply boundary conditions.
     --
 
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for p_raw = p_span.start, p_span.stop do
       var p = unsafe_cast(ptr(point, rp), p_raw)
 
@@ -1131,7 +1135,7 @@ do
     do
       var fuzz = 1e-99
       var dth = 0.5 * dt
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for p_raw = p_span.start, p_span.stop do
         var p = unsafe_cast(ptr(point, rp), p_raw)
 
@@ -1364,7 +1368,7 @@ do
 
     do
       var dtiny = 1.0 / dt
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -1379,7 +1383,7 @@ do
 
     do
       var fuzz = 1e-99
-      --__demand(__vectorize)
+      __demand(__vectorize)
       for z_raw = z_span.start, z_span.stop do
         var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -1387,7 +1391,7 @@ do
       end
     end
 
-    --__demand(__vectorize)
+    __demand(__vectorize)
     for z_raw = z_span.start, z_span.stop do
       var z = unsafe_cast(ptr(zone, rz), z_raw)
 
@@ -1799,6 +1803,7 @@ task test()
   __demand(__spmd)
   do
     -- Main Simulation Loop
+    __demand(__trace)
     while continue_simulation(warmup, cycle, cstop, time, tstop) do
       -- if warmup and cycle > 0 then
       --   wait_for(dthydro)
@@ -1812,7 +1817,7 @@ task test()
       --   last_time = start_time
       -- end
 
-      -- c.legion_runtime_begin_trace(__runtime(), __context(), 0)
+      -- c.legion_runtime_begin_trace(__runtime(), __context(), 0, false)
 
       dt = calc_global_dt(dt, dtfac, dtinit, dtmax, dthydro, time, tstop, cycle)
 

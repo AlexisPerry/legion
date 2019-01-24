@@ -547,19 +547,20 @@ function type_check.expr_field_access(cx, node)
   elseif std.is_ispace(std.as_read(unpack_type)) and node.field_name == "volume" then
     -- Volume can be retrieved on any ispace.
     field_type = int64
-  elseif std.is_region(std.as_read(unpack_type)) and node.field_name == "bounds" then
-    local index_type = std.as_read(unpack_type):ispace().index_type
-    if index_type:is_opaque() then
-      report.error(node, "no field '" .. node.field_name .. "' in type " ..
-                  tostring(std.as_read(unpack_type)))
-    end
-    field_type = std.rect_type(index_type)
+  elseif std.is_region(std.as_read(unpack_type)) and (node.field_name == "bounds" or node.field_name == "volume") then
+    -- Index space fields can also be retrieved through a region.
+    return type_check.expr(
+      cx,
+      node {
+        value = ast.specialized.expr.FieldAccess {
+          value = node.value,
+          field_name = "ispace",
+          span = node.value.span,
+          annotations = node.value.annotations,
+        }
+      })
   elseif std.is_partition(std.as_read(unpack_type)) and node.field_name == "colors" then
     field_type = std.as_read(unpack_type):colors()
-    if field_type:is_opaque() then
-      report.error(node, "no field '" .. node.field_name .. "' in type " ..
-                  tostring(std.as_read(unpack_type)))
-    end
   elseif std.type_is_opaque_to_field_accesses(std.as_read(unpack_type)) then
     report.error(node, "no field '" .. node.field_name .. "' in type " ..
                 tostring(std.as_read(value_type)))
@@ -742,11 +743,21 @@ function type_check.expr_index_access(cx, node)
     end
   else
     -- Ask the Terra compiler to kindly tell us what type this operator returns.
-    local function test()
-      local terra query(a : value_type, i : index_type)
-        return a[i]
+    local test
+    if std.is_regent_array(value_type) then
+      test = function()
+        local terra query(a : value_type, i : index_type)
+          return a.impl[i]
+        end
+        return query:gettype().returntype
       end
-      return query:gettype().returntype
+    else
+      test = function()
+        local terra query(a : value_type, i : index_type)
+          return a[i]
+        end
+        return query:gettype().returntype
+      end
     end
     local valid, result_type = pcall(test)
 
@@ -875,6 +886,8 @@ function type_check.expr_call(cx, node)
       end
     elseif std.is_task(fn.value) then
       fn_type = fn.value:get_type()
+    elseif std.is_math_fn(fn.value) then
+      fn_type = fn.value:get_definition().type
     elseif type(fn.value) == "function" then
       fn_type = untyped_fn
     else
@@ -1216,7 +1229,7 @@ end
 function type_check.expr_isnull(cx, node)
   local pointer = type_check.expr(cx, node.pointer)
   local pointer_type = std.check_read(cx, pointer)
-  if not std.is_bounded_type(pointer_type) then
+  if not (std.is_bounded_type(pointer_type) or pointer_type:ispointer()) then
     report.error(node, "isnull requires bounded type, got " .. tostring(pointer_type))
   end
   return ast.typed.expr.Isnull {
@@ -1255,7 +1268,7 @@ end
 
 function type_check.expr_null(cx, node)
   local pointer_type = node.pointer_type
-  if not std.is_bounded_type(pointer_type) then
+  if not (std.is_bounded_type(pointer_type) or pointer_type:ispointer()) then
     report.error(node, "null requires bounded type, got " .. tostring(pointer_type))
   end
   return ast.typed.expr.Null {
@@ -1490,6 +1503,14 @@ function type_check.expr_partition(cx, node)
                     tostring(coloring_type))
       end
     end
+  end
+
+  if coloring_type == std.c.legion_coloring_t then
+    report.warn(node, "WARNING: using old style partition API with legion_coloring_t, please consider upgrading to legion_point_coloring_t")
+  end
+
+  if coloring_type == std.c.legion_domain_coloring_t then
+    report.warn(node, "WARNING: using old style partition API with legion_domain_coloring_t, please consider upgrading to legion_domain_point_coloring_t")
   end
 
   local region_symbol
@@ -2902,6 +2923,20 @@ function type_check.expr_binary(cx, node)
 
     expr_type = std.partition(
       disjointness, lhs_type.parent_region_symbol, lhs_type.colors_symbol)
+  elseif std.is_index_type(lhs_type) and (std.is_region(rhs_type) or std.is_ispace(rhs_type)) then
+    if node.op ~= "<=" then
+      report.error(node.rhs, "operator " .. tostring(node.op) ..
+                  " not supported on " .. tostring(lhs_type) .. " and " ..
+                  tostring(rhs_type))
+    end
+    expr_type = bool
+  elseif std.is_ispace(lhs_type) and std.is_ispace(rhs_type) then
+    if not (node.op == "&" or node.op == "|")  then
+      report.error(node.rhs, "operator " .. tostring(node.op) ..
+                  " not supported on " .. tostring(lhs_type) .. " and " ..
+                  tostring(rhs_type))
+    end
+    expr_type = std.ispace(lhs_type.index_type)
   else
     if node.op == "&" or node.op == "|" then
       report.error(node.rhs, "operator " .. tostring(node.op) ..
@@ -2975,186 +3010,93 @@ function type_check.expr_parallelizer_constraint(cx, node)
   }
 end
 
-function type_check.expr(cx, node)
-  if node:is(ast.specialized.expr.ID) then
-    return type_check.expr_id(cx, node)
+local function unreachable(node)
+  assert(false, "unreachable")
+end
 
-  elseif node:is(ast.specialized.expr.Constant) then
-    return type_check.expr_constant(cx, node)
+local type_check_expr_node = {
+  [ast.specialized.expr.ID]                         = type_check.expr_id,
+  [ast.specialized.expr.Constant]                   = type_check.expr_constant,
+  [ast.specialized.expr.Function]                   = type_check.expr_function,
+  [ast.specialized.expr.FieldAccess]                = type_check.expr_field_access,
+  [ast.specialized.expr.IndexAccess]                = type_check.expr_index_access,
+  [ast.specialized.expr.MethodCall]                 = type_check.expr_method_call,
+  [ast.specialized.expr.Call]                       = type_check.expr_call,
+  [ast.specialized.expr.Cast]                       = type_check.expr_cast,
+  [ast.specialized.expr.Ctor]                       = type_check.expr_ctor,
+  [ast.specialized.expr.RawContext]                 = type_check.expr_raw_context,
+  [ast.specialized.expr.RawFields]                  = type_check.expr_raw_fields,
+  [ast.specialized.expr.RawPhysical]                = type_check.expr_raw_physical,
+  [ast.specialized.expr.RawRuntime]                 = type_check.expr_raw_runtime,
+  [ast.specialized.expr.RawValue]                   = type_check.expr_raw_value,
+  [ast.specialized.expr.Isnull]                     = type_check.expr_isnull,
+  [ast.specialized.expr.New]                        = type_check.expr_new,
+  [ast.specialized.expr.Null]                       = type_check.expr_null,
+  [ast.specialized.expr.DynamicCast]                = type_check.expr_dynamic_cast,
+  [ast.specialized.expr.StaticCast]                 = type_check.expr_static_cast,
+  [ast.specialized.expr.UnsafeCast]                 = type_check.expr_unsafe_cast,
+  [ast.specialized.expr.Ispace]                     = type_check.expr_ispace,
+  [ast.specialized.expr.Region]                     = type_check.expr_region,
+  [ast.specialized.expr.Partition]                  = type_check.expr_partition,
+  [ast.specialized.expr.PartitionEqual]             = type_check.expr_partition_equal,
+  [ast.specialized.expr.PartitionByField]           = type_check.expr_partition_by_field,
 
-  elseif node:is(ast.specialized.expr.Function) then
-    return type_check.expr_function(cx, node)
-
-  elseif node:is(ast.specialized.expr.FieldAccess) then
-    return type_check.expr_field_access(cx, node)
-
-  elseif node:is(ast.specialized.expr.IndexAccess) then
-    return type_check.expr_index_access(cx, node)
-
-  elseif node:is(ast.specialized.expr.MethodCall) then
-    return type_check.expr_method_call(cx, node)
-
-  elseif node:is(ast.specialized.expr.Call) then
-    return type_check.expr_call(cx, node)
-
-  elseif node:is(ast.specialized.expr.Cast) then
-    return type_check.expr_cast(cx, node)
-
-  elseif node:is(ast.specialized.expr.Ctor) then
-    return type_check.expr_ctor(cx, node)
-
-  elseif node:is(ast.specialized.expr.RawContext) then
-    return type_check.expr_raw_context(cx, node)
-
-  elseif node:is(ast.specialized.expr.RawFields) then
-    return type_check.expr_raw_fields(cx, node)
-
-  elseif node:is(ast.specialized.expr.RawPhysical) then
-    return type_check.expr_raw_physical(cx, node)
-
-  elseif node:is(ast.specialized.expr.RawRuntime) then
-    return type_check.expr_raw_runtime(cx, node)
-
-  elseif node:is(ast.specialized.expr.RawValue) then
-    return type_check.expr_raw_value(cx, node)
-
-  elseif node:is(ast.specialized.expr.Isnull) then
-    return type_check.expr_isnull(cx, node)
-
-  elseif node:is(ast.specialized.expr.New) then
-    return type_check.expr_new(cx, node)
-
-  elseif node:is(ast.specialized.expr.Null) then
-    return type_check.expr_null(cx, node)
-
-  elseif node:is(ast.specialized.expr.DynamicCast) then
-    return type_check.expr_dynamic_cast(cx, node)
-
-  elseif node:is(ast.specialized.expr.StaticCast) then
-    return type_check.expr_static_cast(cx, node)
-
-  elseif node:is(ast.specialized.expr.UnsafeCast) then
-    return type_check.expr_unsafe_cast(cx, node)
-
-  elseif node:is(ast.specialized.expr.Ispace) then
-    return type_check.expr_ispace(cx, node)
-
-  elseif node:is(ast.specialized.expr.Region) then
-    return type_check.expr_region(cx, node)
-
-  elseif node:is(ast.specialized.expr.Partition) then
-    return type_check.expr_partition(cx, node)
-
-  elseif node:is(ast.specialized.expr.PartitionEqual) then
-    return type_check.expr_partition_equal(cx, node)
-
-  elseif node:is(ast.specialized.expr.PartitionByField) then
-    return type_check.expr_partition_by_field(cx, node)
-
-  elseif node:is(ast.specialized.expr.Image) then
+  [ast.specialized.expr.Image] = function(cx, node)
     if not node.region.fields and
        node.region.region:is(ast.specialized.expr.Function) then
       return type_check.expr_image_by_task(cx, node)
     else
       return type_check.expr_image(cx, node)
     end
+  end,
 
-  elseif node:is(ast.specialized.expr.Preimage) then
-    return type_check.expr_preimage(cx, node)
+  [ast.specialized.expr.Preimage]                   = type_check.expr_preimage,
+  [ast.specialized.expr.CrossProduct]               = type_check.expr_cross_product,
+  [ast.specialized.expr.CrossProductArray]          = type_check.expr_cross_product_array,
+  [ast.specialized.expr.ListSlicePartition]         = type_check.expr_list_slice_partition,
+  [ast.specialized.expr.ListDuplicatePartition]     = type_check.expr_list_duplicate_partition,
+  [ast.specialized.expr.ListCrossProduct]           = type_check.expr_list_cross_product,
+  [ast.specialized.expr.ListCrossProductComplete]   = type_check.expr_list_cross_product_complete,
+  [ast.specialized.expr.ListPhaseBarriers]          = type_check.expr_list_phase_barriers,
+  [ast.specialized.expr.ListInvert]                 = type_check.expr_list_invert,
+  [ast.specialized.expr.ListRange]                  = type_check.expr_list_range,
+  [ast.specialized.expr.ListIspace]                 = type_check.expr_list_ispace,
+  [ast.specialized.expr.ListFromElement]            = type_check.expr_list_from_element,
+  [ast.specialized.expr.PhaseBarrier]               = type_check.expr_phase_barrier,
+  [ast.specialized.expr.DynamicCollective]          = type_check.expr_dynamic_collective,
+  [ast.specialized.expr.DynamicCollectiveGetResult] = type_check.expr_dynamic_collective_get_result,
+  [ast.specialized.expr.Advance]                    = type_check.expr_advance,
+  [ast.specialized.expr.Adjust]                     = type_check.expr_adjust,
+  [ast.specialized.expr.Arrive]                     = type_check.expr_arrive,
+  [ast.specialized.expr.Await]                      = type_check.expr_await,
+  [ast.specialized.expr.Copy]                       = type_check.expr_copy,
+  [ast.specialized.expr.Fill]                       = type_check.expr_fill,
+  [ast.specialized.expr.Acquire]                    = type_check.expr_acquire,
+  [ast.specialized.expr.Release]                    = type_check.expr_release,
+  [ast.specialized.expr.AttachHDF5]                 = type_check.expr_attach_hdf5,
+  [ast.specialized.expr.DetachHDF5]                 = type_check.expr_detach_hdf5,
+  [ast.specialized.expr.AllocateScratchFields]      = type_check.expr_allocate_scratch_fields,
+  [ast.specialized.expr.WithScratchFields]          = type_check.expr_with_scratch_fields,
+  [ast.specialized.expr.Unary]                      = type_check.expr_unary,
+  [ast.specialized.expr.Binary]                     = type_check.expr_binary,
+  [ast.specialized.expr.Deref]                      = type_check.expr_deref,
 
-  elseif node:is(ast.specialized.expr.CrossProduct) then
-    return type_check.expr_cross_product(cx, node)
-
-  elseif node:is(ast.specialized.expr.CrossProductArray) then
-    return type_check.expr_cross_product_array(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListSlicePartition) then
-    return type_check.expr_list_slice_partition(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListDuplicatePartition) then
-    return type_check.expr_list_duplicate_partition(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListCrossProduct) then
-    return type_check.expr_list_cross_product(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListCrossProductComplete) then
-    return type_check.expr_list_cross_product_complete(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListPhaseBarriers) then
-    return type_check.expr_list_phase_barriers(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListInvert) then
-    return type_check.expr_list_invert(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListRange) then
-    return type_check.expr_list_range(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListIspace) then
-    return type_check.expr_list_ispace(cx, node)
-
-  elseif node:is(ast.specialized.expr.ListFromElement) then
-    return type_check.expr_list_from_element(cx, node)
-
-  elseif node:is(ast.specialized.expr.PhaseBarrier) then
-    return type_check.expr_phase_barrier(cx, node)
-
-  elseif node:is(ast.specialized.expr.DynamicCollective) then
-    return type_check.expr_dynamic_collective(cx, node)
-
-  elseif node:is(ast.specialized.expr.DynamicCollectiveGetResult) then
-    return type_check.expr_dynamic_collective_get_result(cx, node)
-
-  elseif node:is(ast.specialized.expr.Advance) then
-    return type_check.expr_advance(cx, node)
-
-  elseif node:is(ast.specialized.expr.Adjust) then
-    return type_check.expr_adjust(cx, node)
-
-  elseif node:is(ast.specialized.expr.Arrive) then
-    return type_check.expr_arrive(cx, node)
-
-  elseif node:is(ast.specialized.expr.Await) then
-    return type_check.expr_await(cx, node)
-
-  elseif node:is(ast.specialized.expr.Copy) then
-    return type_check.expr_copy(cx, node)
-
-  elseif node:is(ast.specialized.expr.Fill) then
-    return type_check.expr_fill(cx, node)
-
-  elseif node:is(ast.specialized.expr.Acquire) then
-    return type_check.expr_acquire(cx, node)
-
-  elseif node:is(ast.specialized.expr.Release) then
-    return type_check.expr_release(cx, node)
-
-  elseif node:is(ast.specialized.expr.AttachHDF5) then
-    return type_check.expr_attach_hdf5(cx, node)
-
-  elseif node:is(ast.specialized.expr.DetachHDF5) then
-    return type_check.expr_detach_hdf5(cx, node)
-
-  elseif node:is(ast.specialized.expr.AllocateScratchFields) then
-    return type_check.expr_allocate_scratch_fields(cx, node)
-
-  elseif node:is(ast.specialized.expr.WithScratchFields) then
-    return type_check.expr_with_scratch_fields(cx, node)
-
-  elseif node:is(ast.specialized.expr.Unary) then
-    return type_check.expr_unary(cx, node)
-
-  elseif node:is(ast.specialized.expr.Binary) then
-    return type_check.expr_binary(cx, node)
-
-  elseif node:is(ast.specialized.expr.Deref) then
-    return type_check.expr_deref(cx, node)
-
-  elseif node:is(ast.specialized.expr.LuaTable) then
+  [ast.specialized.expr.LuaTable] = function(cx, node)
     report.error(node, "unable to specialize value of type table")
+  end,
 
-  else
-    assert(false, "unexpected node type " .. tostring(node.node_type))
-  end
+  [ast.specialized.expr.CtorListField] = unreachable,
+  [ast.specialized.expr.CtorRecField]  = unreachable,
+  [ast.specialized.expr.RegionRoot]    = unreachable,
+  [ast.specialized.expr.Condition]     = unreachable,
+}
+
+local type_check_expr = ast.make_single_dispatch(
+  type_check_expr_node,
+  {ast.specialized.expr})
+
+function type_check.expr(cx, node)
+  return type_check_expr(cx)(node)
 end
 
 function type_check.block(cx, node)
@@ -3633,61 +3575,116 @@ function type_check.stat_parallelize_with(cx, node)
   }
 end
 
-function type_check.stat(cx, node)
-  if node:is(ast.specialized.stat.If) then
-    return type_check.stat_if(cx, node)
+local supported_parallel_prefix_ops = {
+  ["+"] = true,
+  ["*"] = true,
+  ["min"] = true,
+  ["max"] = true,
+}
 
-  elseif node:is(ast.specialized.stat.While) then
-    return type_check.stat_while(cx, node)
+function type_check.stat_parallel_prefix(cx, node)
+  local lhs = type_check.expr_region_root(cx, node.lhs)
+  local rhs = type_check.expr_region_root(cx, node.rhs)
+  local op = node.op
+  local dir = type_check.expr(cx, node.dir)
 
-  elseif node:is(ast.specialized.stat.ForNum) then
-    return type_check.stat_for_num(cx, node)
+  local args = terralib.newlist({lhs, rhs})
+  local prev_field_type = nil
+  local prev_ispace_type = nil
+  for i = 1, #args do
+    local arg = args[i]
+    assert(std.is_region(arg.expr_type))
+    local prefix = "type mismatch in argument " .. tostring(i) .. ": "
+    if #arg.fields > 1 then
+      report.error(arg, prefix .. "expected one or no field path, but got " .. tostring(#arg.fields))
+    end
 
-  elseif node:is(ast.specialized.stat.ForList) then
-    return type_check.stat_for_list(cx, node)
+    local field_type = arg.expr_type:fspace()
+    if #arg.fields > 0 then
+      field_type = std.get_field_path(field_type, arg.fields[1])
+    end
+    if not field_type:isprimitive() then
+      report.error(arg, prefix .. "expected a primitive type, but got " .. tostring(field_type))
+    end
+    if prev_field_type ~= nil and not std.type_eq(prev_field_type, field_type) then
+      report.error(arg,
+          prefix .. "expected " .. tostring(prev_field_type) .. ", but got " .. tostring(field_type))
+    end
+    prev_field_type = field_type
 
-  elseif node:is(ast.specialized.stat.Repeat) then
-    return type_check.stat_repeat(cx, node)
-
-  elseif node:is(ast.specialized.stat.MustEpoch) then
-    return type_check.stat_must_epoch(cx, node)
-
-  elseif node:is(ast.specialized.stat.Block) then
-    return type_check.stat_block(cx, node)
-
-  elseif node:is(ast.specialized.stat.Var) then
-    return type_check.stat_var(cx, node)
-
-  elseif node:is(ast.specialized.stat.VarUnpack) then
-    return type_check.stat_var_unpack(cx, node)
-
-  elseif node:is(ast.specialized.stat.Return) then
-    return type_check.stat_return(cx, node)
-
-  elseif node:is(ast.specialized.stat.Break) then
-    return type_check.stat_break(cx, node)
-
-  elseif node:is(ast.specialized.stat.Assignment) then
-    return type_check.stat_assignment(cx, node)
-
-  elseif node:is(ast.specialized.stat.Reduce) then
-    return type_check.stat_reduce(cx, node)
-
-  elseif node:is(ast.specialized.stat.Expr) then
-    return type_check.stat_expr(cx, node)
-
-  elseif node:is(ast.specialized.stat.RawDelete) then
-    return type_check.stat_raw_delete(cx, node)
-
-  elseif node:is(ast.specialized.stat.Fence) then
-    return type_check.stat_fence(cx, node)
-
-  elseif node:is(ast.specialized.stat.ParallelizeWith) then
-    return type_check.stat_parallelize_with(cx, node)
-
-  else
-    assert(false, "unexpected node type " .. tostring(node:type()))
+    local ispace_type = arg.expr_type:ispace()
+    -- TODO: Need to extend the parallel prefix operator implementation to multi-dimensional regions
+    if ispace_type.dim ~= 1 then
+      report.error(arg,
+          prefix .. "expected a region of " .. tostring(ispace(int1d)) ..
+          ", but got a region of " .. tostring(ispace_type))
+    end
+    prev_ispace_type = ispace_type
   end
+
+  if not supported_parallel_prefix_ops[node.op] then
+    report.error(node,
+        "type mismatch in argument 3: operator " .. node.op .. " is not a parallel prefix operator")
+  end
+
+  if not std.as_read(dir.expr_type):isintegral() then
+    report.error(node.dir,
+        "type mismatch in argument 4: expected an integer type, but got " .. tostring(dir.expr_type))
+  end
+  local lhs_field_path = data.newtuple()
+  if #lhs.fields > 0 then lhs_field_path = lhs.fields[1] end
+  if not std.check_privilege(cx, std.writes, lhs.expr_type, lhs_field_path) then
+    report.error(lhs,
+        "invalid privilege in argument 1: " .. tostring(std.writes) .. "(" ..
+        (data.newtuple(lhs.region.value) .. lhs_field_path):mkstring(".") .. ")")
+  end
+  local rhs_field_path = data.newtuple()
+  if #rhs.fields > 0 then rhs_field_path = rhs.fields[1] end
+  if not std.check_privilege(cx, std.reads, rhs.expr_type, rhs_field_path) then
+    report.error(rhs,
+        "invalid privilege in argument 2: " .. tostring(std.reads) .. "(" ..
+        (data.newtuple(rhs.region.value) .. rhs_field_path):mkstring(".") .. ")")
+  end
+
+  return ast.typed.stat.ParallelPrefix {
+    lhs = lhs,
+    rhs = rhs,
+    op = op,
+    dir = dir,
+    annotations = node.annotations,
+    span = node.span,
+  }
+end
+
+local type_check_stat_node = {
+  [ast.specialized.stat.If]              = type_check.stat_if,
+  [ast.specialized.stat.While]           = type_check.stat_while,
+  [ast.specialized.stat.ForNum]          = type_check.stat_for_num,
+  [ast.specialized.stat.ForList]         = type_check.stat_for_list,
+  [ast.specialized.stat.Repeat]          = type_check.stat_repeat,
+  [ast.specialized.stat.MustEpoch]       = type_check.stat_must_epoch,
+  [ast.specialized.stat.Block]           = type_check.stat_block,
+  [ast.specialized.stat.Var]             = type_check.stat_var,
+  [ast.specialized.stat.VarUnpack]       = type_check.stat_var_unpack,
+  [ast.specialized.stat.Return]          = type_check.stat_return,
+  [ast.specialized.stat.Break]           = type_check.stat_break,
+  [ast.specialized.stat.Assignment]      = type_check.stat_assignment,
+  [ast.specialized.stat.Reduce]          = type_check.stat_reduce,
+  [ast.specialized.stat.Expr]            = type_check.stat_expr,
+  [ast.specialized.stat.RawDelete]       = type_check.stat_raw_delete,
+  [ast.specialized.stat.Fence]           = type_check.stat_fence,
+  [ast.specialized.stat.ParallelizeWith] = type_check.stat_parallelize_with,
+  [ast.specialized.stat.ParallelPrefix]  = type_check.stat_parallel_prefix,
+
+  [ast.specialized.stat.Elseif] = unreachable,
+}
+
+local type_check_stat = ast.make_single_dispatch(
+  type_check_stat_node,
+  {ast.specialized.stat})
+
+function type_check.stat(cx, node)
+  return type_check_stat(cx)(node)
 end
 
 function type_check.top_task_param(cx, node, mapping, is_defined)
@@ -3803,6 +3800,7 @@ function type_check.top_task(cx, node)
       leaf = false,
       inner = false,
       idempotent = false,
+      replicable = false,
     },
     region_divergence = false,
     prototype = prototype,
@@ -3833,11 +3831,7 @@ end
 
 function type_check.top(cx, node)
   if node:is(ast.specialized.top.Task) then
-    local new_node = type_check.top_task(cx, node)
-    if new_node.prototype:has_primary_variant() then
-      new_node.prototype:get_primary_variant():set_ast(new_node)
-    end
-    return new_node
+    return type_check.top_task(cx, node)
 
   elseif node:is(ast.specialized.top.Fspace) then
     return type_check.top_fspace(cx, node)

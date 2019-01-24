@@ -59,6 +59,8 @@ function parser.annotation_name(p, required)
     return "cuda", values
   elseif p:nextif("__external") then
     return "external"
+  elseif p:nextif("__idempotent") then
+    return "idempotent"
   elseif p:nextif("__inline") then
     return "inline"
   elseif p:nextif("__inner") then
@@ -71,6 +73,8 @@ function parser.annotation_name(p, required)
     return "optimize"
   elseif p:nextif("__parallel") then
     return "parallel"
+  elseif p:nextif("__replicable") then
+    return "replicable"
   elseif p:nextif("__spmd") then
     return "spmd"
   elseif p:nextif("__trace") then
@@ -1402,7 +1406,7 @@ parser.expr = parsing.Pratt()
   :infix("&", 15, parser.expr_binary_left)
   :infix("|", 12, parser.expr_binary_left)
   :infix("and", 10, parser.expr_binary_left)
-  :infix("or", 10, parser.expr_binary_left)
+  :infix("or", 8, parser.expr_binary_left)
   :prefix(parsing.default, parser.expr_simple)
 
 function parser.expr_lhs(p)
@@ -1733,6 +1737,28 @@ function parser.stat_parallelize_with(p, annotations)
   }
 end
 
+function parser.stat_parallel_prefix(p, annotations)
+  local start = ast.save(p)
+  p:expect("__parallel_prefix")
+  p:expect("(")
+  local lhs = p:expr_region_root()
+  p:expect(",")
+  local rhs = p:expr_region_root()
+  p:expect(",")
+  local op = p:reduction_op()
+  p:expect(",")
+  local dir = p:expr()
+  p:expect(")")
+  return ast.unspecialized.stat.ParallelPrefix {
+    lhs = lhs,
+    rhs = rhs,
+    op = op,
+    dir = dir,
+    annotations = annotations,
+    span = ast.span(start, p),
+  }
+end
+
 function parser.stat_expr_assignment(p, start, first_lhs, annotations)
   local lhs = terralib.newlist()
   lhs:insert(first_lhs)
@@ -1871,6 +1897,9 @@ function parser.stat(p)
 
   elseif p:matches("__parallelize_with") then
     return p:stat_parallelize_with(annotations)
+
+  elseif p:matches("__parallel_prefix") then
+    return p:stat_parallel_prefix(annotations)
 
   else
     return p:stat_expr(annotations)

@@ -13,7 +13,7 @@
 -- limitations under the License.
 
 -- runs-with:
--- [["-ll:cpu", "4", "-fbounds-checks", "1", "-fdebug", "1"]]
+-- [["-ll:cpu", "4", "-fbounds-checks", "1"]]
 
 import "regent"
 
@@ -117,6 +117,7 @@ task test(size : int)
   c.srand48(12345)
   var is = ispace(int2d, {size, size})
   var primary_region = region(is, fs)
+  fill(primary_region.{f, g, h}, 0.0)
   var np = 2
   var bounds = primary_region.bounds
   var coloring = c.legion_domain_point_coloring_create()

@@ -39,15 +39,23 @@ end
 function passes.codegen(node, allow_pretty)
   if allow_pretty == nil then allow_pretty = true end
 
-  if allow_pretty and std.config["pretty"] then print(pretty.entry(node)) end
-  if std.config["validate"] then validate.entry(node) end
-  return codegen.entry(node)
+  if allow_pretty and std.config["pretty"] then print(profile("pretty", node, pretty.entry)(node)) end
+  if std.config["validate"] then profile("validate", node, validate.entry)(node) end
+  return profile("codegen", node, codegen.entry)(node)
+end
+
+local function optimize_and_codegen(node, allow_pretty)
+  node = profile("normalize_after_type_check", node, normalize.entry)(node)
+  node = profile("check_annotations", node, check_annotations.entry)(node)
+  node = passes.optimize(node)
+  return passes.codegen(node, allow_pretty)
 end
 
 function passes.compile(node, allow_pretty)
   local function ctor(environment_function)
     local env = environment_function()
     local node = profile("specialize", node, specialize.entry)(env, node)
+    if std.is_rquote(node) then return node end
     node = profile("normalize_after_specialize", node, normalize.entry)(node)
     if std.config["inline"] then
       node = profile("inline_tasks", node, inline_tasks.entry)(node)
@@ -57,10 +65,12 @@ function passes.compile(node, allow_pretty)
     if std.config["inline"] then
       node = profile("eliminate_dead_code", node, eliminate_dead_code.entry)(node)
     end
-    node = profile("normalize_after_type_check", node, normalize.entry)(node)
-    node = profile("check_annotations", node, check_annotations.entry)(node)
-    node = passes.optimize(node)
-    return profile("codegen", node, passes.codegen)(node, allow_pretty)
+    if std.config["inline"] and std.is_inline_task(node) then
+      local task = node.prototype
+      task:set_optimization_thunk(function() optimize_and_codegen(node, allow_pretty) end)
+      return task
+    end
+    return optimize_and_codegen(node)
   end
   return ctor
 end

@@ -54,6 +54,7 @@ namespace Legion {
       // Get the location of this physical instance
       Memory get_location(void) const;
       unsigned long get_instance_id(void) const;
+      size_t get_instance_size(void) const;
       // Adds all fields that exist in instance to 'fields', unless
       //  instance is virtual
       void get_fields(std::set<FieldID> &fields) const;
@@ -230,7 +231,7 @@ namespace Legion {
       Mapper(MapperRuntime *rt);
       virtual ~Mapper(void);
     public:
-      MapperRuntime *const runtime;
+      MapperRuntime *const runtime; 
     public:
       /**
        ** ----------------------------------------------------------------------
@@ -317,6 +318,17 @@ namespace Legion {
        *     from being stolen as it will have already been mapped
        *     once it enters the ready queue.
        *
+       * valid_instance default:true
+       *     When calls to map_task are performed, it's often the 
+       *     case that the mapper will want to know the currently valid
+       *     instances are for that region. There is some overhead to
+       *     doing this and the mapper may want to avoid this overhead
+       *     in cases where it knows it won't need the information such
+       *     as when it is going to virtually map all the regions for 
+       *     an inner task. By setting this flag to false the mapper
+       *     can opt-out of receiving the valid instance information
+       *     for a task.
+       *
        * parent_priority default:current
        *     If the mapper for the parent task permits child
        *     operations to mutate the priority of the parent task
@@ -328,6 +340,9 @@ namespace Legion {
         bool                                   inline_task;  // = false
         bool                                   stealable;   // = false
         bool                                   map_locally;  // = false
+        bool                                   valid_instances; // = true
+        bool                                   memoize;  // = false
+        bool                                   replicate; // = false
         TaskPriority                           parent_priority; // = current
       };
       //------------------------------------------------------------------------
@@ -422,6 +437,7 @@ namespace Legion {
       struct SliceTaskInput {
         IndexSpace                             domain_is;
         Domain                                 domain;
+        IndexSpace                             sharding_is;
       };
       struct SliceTaskOutput {
         std::vector<TaskSlice>                 slices;
@@ -796,14 +812,18 @@ namespace Legion {
        * layouts of the physical instances to be used in the 
        */
       struct MapCopyInput {
-        std::vector<std::vector<PhysicalInstance> >       src_instances;
-        std::vector<std::vector<PhysicalInstance> >       dst_instances;
+        std::vector<std::vector<PhysicalInstance> >     src_instances;
+        std::vector<std::vector<PhysicalInstance> >     dst_instances;
+        std::vector<std::vector<PhysicalInstance> >     src_indirect_instances;
+        std::vector<std::vector<PhysicalInstance> >     dst_indirect_instances;
       };
       struct MapCopyOutput {
-        std::vector<std::vector<PhysicalInstance> >       src_instances;
-        std::vector<std::vector<PhysicalInstance> >       dst_instances;
-        ProfilingRequest                                  profiling_requests;
-        TaskPriority                                      profiling_priority;
+        std::vector<std::vector<PhysicalInstance> >     src_instances;
+        std::vector<std::vector<PhysicalInstance> >     dst_instances;
+        std::vector<PhysicalInstance>                   src_indirect_instances;
+        std::vector<PhysicalInstance>                   dst_indirect_instances;
+        ProfilingRequest                                profiling_requests;
+        TaskPriority                                    profiling_priority;
       };
       //------------------------------------------------------------------------
       virtual void map_copy(const MapperContext      ctx,
@@ -1441,10 +1461,15 @@ namespace Legion {
         std::vector<const Task*>                    tasks;
         std::vector<MappingConstraint>              constraints;
         MappingTagID                                mapping_tag;
+        // For collective map_must_epoch only
+        std::vector<Processor>                      shard_mapping;
+        ShardID                                     local_shard;
       };
       struct MapMustEpochOutput {
         std::vector<Processor>                      task_processors;
         std::vector<std::vector<PhysicalInstance> > constraint_mappings;
+        // For collective map_must_epoch only
+        std::vector<int>                            weights;
       };
       //------------------------------------------------------------------------
       virtual void map_must_epoch(const MapperContext           ctx,
@@ -1467,6 +1492,30 @@ namespace Legion {
                                       const MapDataflowGraphInput&  input,
                                             MapDataflowGraphOutput& output) = 0;
       //------------------------------------------------------------------------
+
+    public: // Memoizing physical analyses of operations
+      /**
+       * ----------------------------------------------------------------------
+       *  Memoize Operation
+       * ----------------------------------------------------------------------
+       * The memoize_operation mapper call asks the mapper to decide if the
+       * physical analysis of the operation should be memoized. Operations
+       * that are not being logically traced cannot be memoized.
+       *
+       */
+      struct MemoizeInput {
+        TraceID trace_id;
+      };
+      struct MemoizeOutput {
+        bool memoize;
+      };
+      //------------------------------------------------------------------------
+      virtual void memoize_operation(const MapperContext  ctx,
+                                     const Mappable&      mappable,
+                                     const MemoizeInput&  input,
+                                           MemoizeOutput& output) = 0;
+      //------------------------------------------------------------------------
+
     public: // Mapping control 
       /**
        * ----------------------------------------------------------------------
@@ -1607,6 +1656,23 @@ namespace Legion {
       virtual void handle_task_result(const MapperContext           ctx,
                                       const MapperTaskResult&       result) = 0;
       //------------------------------------------------------------------------
+    public:
+      // Future structs for control replication, 
+      // provided here for forward compatibility
+      struct MapReplicateTaskOutput {
+        std::vector<MapTaskOutput>                      task_mappings;
+        std::vector<Processor>                          control_replication_map;
+      };
+      struct SelectShardingFunctorInput {
+        std::vector<Processor>                  shard_mapping;
+      };
+      struct SelectShardingFunctorOutput {
+        ShardingID                              chosen_functor;
+      };
+      struct MustEpochShardingFunctorOutput :
+              public SelectShardingFunctorOutput {
+        bool                                    collective_map_must_epoch_call;
+      };
     };
 
     /**
@@ -1625,7 +1691,7 @@ namespace Legion {
     public:
       //------------------------------------------------------------------------
       // Methods for managing access to mapper state in the concurrent model
-      // These calls are no-ops in the serialized mapper model 
+      // These calls are illegal in the serialized mapper model 
       //------------------------------------------------------------------------
       bool is_locked(MapperContext ctx) const;
       void lock_mapper(MapperContext ctx, 
@@ -1634,7 +1700,7 @@ namespace Legion {
     public:
       //------------------------------------------------------------------------
       // Methods for managing the re-entrant state in the serialized model
-      // These calls are no-ops in the concurrent mapper model
+      // These calls are illegal in the concurrent mapper model
       //------------------------------------------------------------------------
       bool is_reentrant(MapperContext ctx) const;
       void enable_reentrant(MapperContext ctx) const;
@@ -1725,12 +1791,16 @@ namespace Legion {
                              const TaskLayoutConstraintSet &layout_constraints,
                              TaskID generator_tid, VariantID generator_vid, 
                              Processor generator_processor, bool &created) const;
+      const char* find_task_variant_name(MapperContext ctx,
+                                         TaskID task_id, VariantID vid) const;
       bool is_leaf_variant(MapperContext ctx, TaskID task_id,
                                      VariantID variant_id) const;
       bool is_inner_variant(MapperContext ctx, TaskID task_id,
                                       VariantID variant_id)const;
       bool is_idempotent_variant(MapperContext ctx, TaskID task_id,
                                            VariantID variant_id) const;
+      bool is_replicable_variant(MapperContext ctx, TaskID task_id,
+                                      VariantID variant_id) const; 
     public:
       //------------------------------------------------------------------------
       // Methods for accelerating mapping decisions
@@ -1884,6 +1954,9 @@ namespace Legion {
 
       Color get_index_space_color(MapperContext ctx, 
                                             IndexSpace handle) const;
+
+      DomainPoint get_index_space_color_point(MapperContext ctx,
+                                              IndexSpace handle) const;
 
       Color get_index_partition_color(MapperContext ctx, 
                                                 IndexPartition handle) const;

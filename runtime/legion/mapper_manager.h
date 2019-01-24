@@ -56,12 +56,18 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_DEFER_MAPPER_MESSAGE_TASK_ID;
       public:
-        MapperManager *manager;
-        Processor sender;
-        unsigned kind;
-        void *message;
-        size_t size;
-        bool broadcast;
+        DeferMessageArgs(MapperManager *man, Processor p, unsigned k,
+                         void *m, size_t s, bool b)
+          : LgTaskArgs<DeferMessageArgs>(implicit_provenance),
+            manager(man), sender(p), kind(k), 
+            message(m), size(s), broadcast(b) { }
+      public:
+        MapperManager *const manager;
+        const Processor sender;
+        const unsigned kind;
+        void *const message;
+        const size_t size;
+        const bool broadcast;
       };
     public:
       MapperManager(Runtime *runtime, Mapping::Mapper *mapper, 
@@ -217,6 +223,11 @@ namespace Legion {
       void invoke_map_dataflow_graph(Mapper::MapDataflowGraphInput *input,
                                      Mapper::MapDataflowGraphOutput *output,
                                      MappingCallInfo *info = NULL);
+    public: // memoization mapper calls
+      void invoke_memoize_operation(Mappable *mappable,
+                                    Mapper::MemoizeInput *input,
+                                    Mapper::MemoizeOutput *output,
+                                    MappingCallInfo *info = NULL);
     public: // scheduling and stealing mapper calls
       void invoke_select_tasks_to_map(Mapper::SelectMappingInput *input,
                                       Mapper::SelectMappingOutput *output,
@@ -289,6 +300,8 @@ namespace Legion {
       void find_valid_variants(MappingCallInfo *ctx, TaskID task_id,
                                std::vector<VariantID> &valid_variants,
                                Processor::Kind kind);
+      const char* find_task_variant_name(MappingCallInfo *ctx,
+                    TaskID task_id, VariantID vid);
       bool is_leaf_variant(MappingCallInfo *ctx, TaskID task_id, 
                            VariantID variant_id);
       bool is_inner_variant(MappingCallInfo *ctx, TaskID task_id, 
@@ -400,6 +413,8 @@ namespace Legion {
       bool is_index_partition_complete(MappingCallInfo *info,
                                        IndexPartition p);
       Color get_index_space_color(MappingCallInfo *info, IndexSpace handle);
+      DomainPoint get_index_space_color_point(MappingCallInfo *info,
+                                              IndexSpace handle);
       Color get_index_partition_color(MappingCallInfo *info, 
                                       IndexPartition handle);
       IndexSpace get_parent_index_space(MappingCallInfo *info,

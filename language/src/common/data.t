@@ -45,6 +45,11 @@
 
 local data = {}
 
+-- Utility for figuring out if we're in LuaJIT or PUC Lua.
+function data.is_luajit()
+  return type(rawget(_G,"jit")) == "table"
+end
+
 -- #####################################
 -- ## Hashing
 -- #################
@@ -421,8 +426,12 @@ function data.map:get(k)
 end
 
 function data.map:put(k, v)
-  self.__keys_by_hash[data.hash(k)] = k
-  self.__values_by_hash[data.hash(k)] = v
+  local kh = data.hash(k)
+  if v == nil then
+    k = nil
+  end
+  self.__keys_by_hash[kh] = k
+  self.__values_by_hash[kh] = v
 end
 
 function data.map:next_item(k)

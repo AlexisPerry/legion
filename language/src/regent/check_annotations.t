@@ -171,7 +171,7 @@ local node_allow_annotations = {
   [ast.typed.stat.Elseif]    = deny_all,
   [ast.typed.stat.While]     = allow({"spmd", "trace"}),
   [ast.typed.stat.ForNum]    = allow(permitted_for_num_annotations),
-  [ast.typed.stat.ForList]   = allow({"openmp", "parallel", "spmd", "trace", "vectorize"}),
+  [ast.typed.stat.ForList]   = allow({"openmp", "parallel", "spmd", "trace", "vectorize", "cuda"}),
   [ast.typed.stat.Repeat]    = allow({"spmd", "trace"}),
   [ast.typed.stat.MustEpoch] = deny_all,
   [ast.typed.stat.Block]     = allow({"spmd", "trace"}),
@@ -186,6 +186,7 @@ local node_allow_annotations = {
   [ast.typed.stat.RawDelete]       = deny_all,
   [ast.typed.stat.Fence]           = deny_all,
   [ast.typed.stat.ParallelizeWith] = deny_all,
+  [ast.typed.stat.ParallelPrefix]  = deny_all,
 
   [ast.typed.stat.Internal]          = unreachable,
   [ast.typed.stat.ForNumVectorized]  = unreachable,
@@ -203,11 +204,13 @@ local node_allow_annotations = {
   [ast.typed.top.Task] = allow({
     "cuda",
     "external",
+    "idempotent",
     "inline",
     "inner",
     "leaf",
     "optimize",
     "parallel",
+    "replicable",
   }),
 
   [ast.typed.top.Fspace] = deny_all,

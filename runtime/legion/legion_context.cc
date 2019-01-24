@@ -30,9 +30,9 @@ namespace Legion {
     /////////////////////////////////////////////////////////////
 
     //--------------------------------------------------------------------------
-    TaskContext::TaskContext(Runtime *rt, TaskOp *owner,
+    TaskContext::TaskContext(Runtime *rt, TaskOp *owner, int d,
                              const std::vector<RegionRequirement> &reqs)
-      : runtime(rt), owner_task(owner), regions(reqs),
+      : runtime(rt), owner_task(owner), regions(reqs), depth(d),
         executing_processor(Processor::NO_PROC), total_tunable_count(0), 
         overhead_tracker(NULL), task_executed(false),
         has_inline_accessor(false), mutable_priority(false),
@@ -43,7 +43,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     TaskContext::TaskContext(const TaskContext &rhs)
-      : runtime(NULL), owner_task(NULL), regions(rhs.regions)
+      : runtime(NULL), owner_task(NULL), regions(rhs.regions), depth(-1)
     //--------------------------------------------------------------------------
     {
       // should never be called
@@ -82,13 +82,6 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       return owner_task->get_unique_op_id();
-    }
-
-    //--------------------------------------------------------------------------
-    int TaskContext::get_depth(void) const
-    //--------------------------------------------------------------------------
-    {
-      return owner_task->get_depth();
     }
 
     //--------------------------------------------------------------------------
@@ -1736,7 +1729,7 @@ namespace Legion {
       implicit_context = this;
       implicit_runtime = this->runtime;
       rt = this->runtime->external;
-      task_profiling_provenance = owner_task->get_unique_op_id();
+      implicit_provenance = owner_task->get_unique_op_id();
       if (overhead_tracker != NULL)
         previous_profiling_time = Realm::Clock::current_time_in_nanoseconds();
       // Switch over the executing processor to the one
@@ -1833,36 +1826,20 @@ namespace Legion {
                       "task %s (UID %lld). Static traces must perfectly "
                       "manage their physical mappings with no runtime help.",
                       get_task_name(), get_unique_id())
-      if (unmapped_regions.size() == 1)
+      std::set<ApEvent> mapped_events;
+      for (unsigned idx = 0; idx < unmapped_regions.size(); idx++)
       {
-        MapOp *op = runtime->get_available_map_op();
-        op->initialize(this, unmapped_regions[0]);
-        ApEvent mapped_event = op->get_completion_event();
-        runtime->add_to_dependence_queue(this, executing_processor, op);
-        if (mapped_event.has_triggered())
-          return;
-        begin_task_wait(true/*from runtime*/);
-        mapped_event.wait();
-        end_task_wait();
+        const ApEvent ready = remap_region(unmapped_regions[idx]);
+        if (ready.exists())
+          mapped_events.insert(ready);
       }
-      else
-      {
-        std::set<ApEvent> mapped_events;
-        for (unsigned idx = 0; idx < unmapped_regions.size(); idx++)
-        {
-          MapOp *op = runtime->get_available_map_op();
-          op->initialize(this, unmapped_regions[idx]);
-          mapped_events.insert(op->get_completion_event());
-          runtime->add_to_dependence_queue(this, executing_processor, op);
-        }
-        // Wait for all the re-mapping operations to complete
-        ApEvent mapped_event = Runtime::merge_events(mapped_events);
-        if (mapped_event.has_triggered())
-          return;
-        begin_task_wait(true/*from runtime*/);
-        mapped_event.wait();
-        end_task_wait();
-      }
+      // Wait for all the re-mapping operations to complete
+      const ApEvent mapped_event = Runtime::merge_events(mapped_events);
+      if (mapped_event.has_triggered())
+        return;
+      begin_task_wait(true/*from runtime*/);
+      mapped_event.wait();
+      end_task_wait();
     }
 
     //--------------------------------------------------------------------------
@@ -1909,26 +1886,26 @@ namespace Legion {
       return result;
     }
 #endif
-
     /////////////////////////////////////////////////////////////
     // Inner Context 
     /////////////////////////////////////////////////////////////
 
     //--------------------------------------------------------------------------
-    InnerContext::InnerContext(Runtime *rt, TaskOp *owner, bool full_inner,
+    InnerContext::InnerContext(Runtime *rt, TaskOp *owner,int d,bool full_inner,
                                const std::vector<RegionRequirement> &reqs,
                                const std::vector<unsigned> &parent_indexes,
                                const std::vector<bool> &virt_mapped,
                                UniqueID uid, bool remote)
-      : TaskContext(rt, owner, reqs), 
+      : TaskContext(rt, owner, d, reqs),
         tree_context(rt->allocate_region_tree_context()), context_uid(uid), 
         remote_context(remote), full_inner_context(full_inner),
         parent_req_indexes(parent_indexes), virtual_mapped(virt_mapped), 
-        total_children_count(0), total_close_count(0), 
+        total_children_count(0), total_close_count(0), total_summary_count(0),
         outstanding_children_count(0), outstanding_prepipeline(0),
         outstanding_dependence(false), outstanding_post_task(0),
-        current_trace(NULL), valid_wait_event(false), outstanding_subtasks(0),
-        pending_subtasks(0), pending_frames(0), currently_active_context(false),
+        current_trace(NULL),previous_trace(NULL),
+        valid_wait_event(false), outstanding_subtasks(0), pending_subtasks(0), 
+        pending_frames(0), currently_active_context(false),
         current_mapping_fence(NULL), mapping_fence_gen(0), 
         current_mapping_fence_index(0), current_execution_fence_index(0) 
     //--------------------------------------------------------------------------
@@ -1967,7 +1944,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     InnerContext::InnerContext(const InnerContext &rhs)
-      : TaskContext(NULL, NULL, rhs.regions), tree_context(rhs.tree_context),
+      : TaskContext(NULL, NULL, 0, rhs.regions), tree_context(rhs.tree_context),
         context_uid(0), remote_context(false), full_inner_context(false),
         parent_req_indexes(rhs.parent_req_indexes), 
         virtual_mapped(rhs.virtual_mapped)
@@ -2075,13 +2052,6 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       return context_uid;
-    }
-
-    //--------------------------------------------------------------------------
-    int InnerContext::get_depth(void) const
-    //--------------------------------------------------------------------------
-    {
-      return owner_task->get_depth();
     }
 
     //--------------------------------------------------------------------------
@@ -2247,8 +2217,6 @@ namespace Legion {
 #ifdef DEBUG_LEGION
       assert(owner_task != NULL);
 #endif
-      rez.serialize<bool>(false); // not the top-level context
-      int depth = get_depth();
       rez.serialize(depth);
       // See if we need to pack up base task information
       owner_task->pack_external_task(rez, target);
@@ -3919,18 +3887,20 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InnerContext::remap_region(PhysicalRegion region)
+    ApEvent InnerContext::remap_region(PhysicalRegion region)
     //--------------------------------------------------------------------------
     {
       AutoRuntimeCall call(this);
       // Check to see if the region is already mapped,
       // if it is then we are done
       if (region.is_mapped())
-        return;
+        return ApEvent::NO_AP_EVENT;
       MapOp *map_op = runtime->get_available_map_op();
       map_op->initialize(this, region);
       register_inline_mapped_region(region);
+      const ApEvent result = map_op->get_completion_event();
       runtime->add_to_dependence_queue(this, executing_processor, map_op);
+      return result;
     }
 
     //--------------------------------------------------------------------------
@@ -4517,6 +4487,25 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    unsigned InnerContext::register_new_summary_operation(TraceSummaryOp *op)
+    //--------------------------------------------------------------------------
+    {
+      // For now we just bump our counter
+      unsigned result = total_summary_count++;
+      const unsigned outstanding_count = 
+        __sync_add_and_fetch(&outstanding_children_count,1);
+      // Only need to check if we are not tracing by frames
+      if ((context_configuration.min_frames_to_schedule == 0) && 
+          (context_configuration.max_window_size > 0) && 
+            (outstanding_count > context_configuration.max_window_size))
+        perform_window_wait();
+      if (runtime->legion_spy_enabled)
+        LegionSpy::log_child_operation_index(get_context_uid(), result, 
+                                             op->get_unique_op_id()); 
+      return result;
+    }
+
+    //--------------------------------------------------------------------------
     void InnerContext::perform_window_wait(void)
     //--------------------------------------------------------------------------
     {
@@ -4826,6 +4815,17 @@ namespace Legion {
         PostEndArgs args(launch_next_op, this);
         runtime->issue_runtime_meta_task(args, LG_THROUGHPUT_WORK_PRIORITY);
       }
+    }
+
+    //--------------------------------------------------------------------------
+    void InnerContext::register_executing_child(Operation *op)
+    //--------------------------------------------------------------------------
+    {
+      AutoLock child_lock(child_op_lock);
+#ifdef DEBUG_LEGION
+      assert(executing_children.find(op) == executing_children.end());
+#endif
+      executing_children[op] = op->get_generation();
     }
 
     //--------------------------------------------------------------------------
@@ -5263,9 +5263,32 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InnerContext::begin_trace(TraceID tid)
+    RtEvent InnerContext::get_current_mapping_fence_event(void)
     //--------------------------------------------------------------------------
     {
+      if (current_mapping_fence == NULL)
+        return RtEvent::NO_RT_EVENT;
+      RtEvent result = current_mapping_fence->get_mapped_event();
+      // Check the generation
+      if (current_mapping_fence->get_generation() == mapping_fence_gen)
+        return result;
+      else
+        return RtEvent::NO_RT_EVENT;
+    }
+
+    //--------------------------------------------------------------------------
+    ApEvent InnerContext::get_current_execution_fence_event(void)
+    //--------------------------------------------------------------------------
+    {
+      return current_execution_fence_event;
+    }
+
+    //--------------------------------------------------------------------------
+    void InnerContext::begin_trace(TraceID tid, bool logical_only)
+    //--------------------------------------------------------------------------
+    {
+      if (runtime->no_tracing) return;
+
       AutoRuntimeCall call(this);
 #ifdef DEBUG_LEGION
       log_run.debug("Beginning a trace in task %s (ID %lld)",
@@ -5279,27 +5302,45 @@ namespace Legion {
                        "task %s (ID %lld)", tid, get_task_name(),
                        get_unique_id())
       std::map<TraceID,DynamicTrace*>::const_iterator finder = traces.find(tid);
+      DynamicTrace* dynamic_trace = NULL;
       if (finder == traces.end())
       {
         // Trace does not exist yet, so make one and record it
-        DynamicTrace *dynamic_trace = new DynamicTrace(tid, this);
+        dynamic_trace = new DynamicTrace(tid, this, logical_only);
         dynamic_trace->add_reference();
         traces[tid] = dynamic_trace;
-        current_trace = dynamic_trace;
       }
       else
+        dynamic_trace = finder->second;
+
+#ifdef DEBUG_LEGION
+      assert(dynamic_trace != NULL);
+#endif
+      dynamic_trace->clear_blocking_call();
+
+      // Issue a begin op
+      TraceBeginOp *begin = runtime->get_available_begin_op();
+      begin->initialize_begin(this, dynamic_trace);
+      runtime->add_to_dependence_queue(this, executing_processor, begin);
+
+      if (!logical_only)
       {
-        // Issue the mapping fence first
-        runtime->issue_mapping_fence(this);
-        // Now mark that we are starting a trace
-        current_trace = finder->second;
+        // Issue a replay op
+        TraceReplayOp *replay = runtime->get_available_replay_op();
+        replay->initialize_replay(this, dynamic_trace);
+        runtime->add_to_dependence_queue(this, executing_processor, replay);
       }
+
+      // Now mark that we are starting a trace
+      current_trace = dynamic_trace;
     }
 
     //--------------------------------------------------------------------------
     void InnerContext::end_trace(TraceID tid)
     //--------------------------------------------------------------------------
     {
+      if (runtime->no_tracing) return;
+
       AutoRuntimeCall call(this);
 #ifdef DEBUG_LEGION
       log_run.debug("Ending a trace in task %s (ID %lld)",
@@ -5316,18 +5357,19 @@ namespace Legion {
           "Illegal end trace call on a static trace in "
                        "task %s (UID %lld)", get_task_name(), get_unique_id());
       }
+      bool has_blocking_call = current_trace->has_blocking_call();
       if (current_trace->is_fixed())
       {
         // Already fixed, dump a complete trace op into the stream
         TraceCompleteOp *complete_op = runtime->get_available_trace_op();
-        complete_op->initialize_complete(this);
+        complete_op->initialize_complete(this, has_blocking_call);
         runtime->add_to_dependence_queue(this, executing_processor, complete_op);
       }
       else
       {
         // Not fixed yet, dump a capture trace op into the stream
         TraceCaptureOp *capture_op = runtime->get_available_capture_op(); 
-        capture_op->initialize_capture(this);
+        capture_op->initialize_capture(this, has_blocking_call);
         runtime->add_to_dependence_queue(this, executing_processor, capture_op);
         // Mark that the current trace is now fixed
         current_trace->as_dynamic_trace()->fix_trace();
@@ -5340,6 +5382,8 @@ namespace Legion {
     void InnerContext::begin_static_trace(const std::set<RegionTreeID> *trees)
     //--------------------------------------------------------------------------
     {
+      if (runtime->no_tracing) return;
+
       AutoRuntimeCall call(this);
 #ifdef DEBUG_LEGION
       log_run.debug("Beginning a static trace in task %s (ID %lld)",
@@ -5362,6 +5406,8 @@ namespace Legion {
     void InnerContext::end_static_trace(void)
     //--------------------------------------------------------------------------
     {
+      if (runtime->no_tracing) return;
+
       AutoRuntimeCall call(this);
 #ifdef DEBUG_LEGION
       log_run.debug("Ending a static trace in task %s (ID %lld)",
@@ -5378,10 +5424,34 @@ namespace Legion {
       // We're done with this trace, need a trace complete op to clean up
       // This operation takes ownership of the static trace reference
       TraceCompleteOp *complete_op = runtime->get_available_trace_op();
-      complete_op->initialize_complete(this);
+      complete_op->initialize_complete(this,current_trace->has_blocking_call());
       runtime->add_to_dependence_queue(this, executing_processor, complete_op);
       // We no longer have a trace that we're executing 
       current_trace = NULL;
+    }
+
+    //--------------------------------------------------------------------------
+    void InnerContext::record_previous_trace(LegionTrace *trace)
+    //--------------------------------------------------------------------------
+    {
+      previous_trace = trace;
+    }
+
+    //--------------------------------------------------------------------------
+    void InnerContext::invalidate_trace_cache(
+                                     LegionTrace *trace, Operation *invalidator)
+    //--------------------------------------------------------------------------
+    {
+      if (previous_trace != NULL && previous_trace != trace)
+        previous_trace->invalidate_trace_cache(invalidator);
+    }
+
+    //--------------------------------------------------------------------------
+    void InnerContext::record_blocking_call(void)
+    //--------------------------------------------------------------------------
+    {
+      if (current_trace != NULL)
+        current_trace->record_blocking_call();
     }
 
     //--------------------------------------------------------------------------
@@ -5580,8 +5650,7 @@ namespace Legion {
       {
         if (need_deferral)
         {
-          PostDecrementArgs post_decrement_args;
-          post_decrement_args.parent_ctx = this;
+          PostDecrementArgs post_decrement_args(this);
           RtEvent done = runtime->issue_runtime_meta_task(post_decrement_args,
               LG_LATENCY_WORK_PRIORITY, wait_on); 
           Runtime::trigger_event(to_trigger, done);
@@ -6158,12 +6227,7 @@ namespace Legion {
       // know it's possible for the update channel to block waiting on
       // the view virtual channel (paging views), so to avoid the cycle
       // we have to launch a meta-task and record when it is done
-      RemoteCreateViewArgs args;
-      args.proxy_this = context;
-      args.manager = manager;
-      args.target = target;
-      args.to_trigger = to_trigger;
-      args.source = source;
+      RemoteCreateViewArgs args(context, manager, target, to_trigger, source);
       runtime->issue_runtime_meta_task(args, LG_LATENCY_DEFERRED_PRIORITY);
     }
 
@@ -6862,7 +6926,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     TopLevelContext::TopLevelContext(Runtime *rt, UniqueID ctx_id)
-      : InnerContext(rt, NULL, false/*full inner*/, dummy_requirements, 
+      : InnerContext(rt, NULL, -1, false/*full inner*/, dummy_requirements, 
                      dummy_indexes, dummy_mapped, ctx_id)
     //--------------------------------------------------------------------------
     {
@@ -6870,7 +6934,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     TopLevelContext::TopLevelContext(const TopLevelContext &rhs)
-      : InnerContext(NULL, NULL, false,
+      : InnerContext(NULL, NULL, -1, false,
                      dummy_requirements, dummy_indexes, dummy_mapped, 0)
     //--------------------------------------------------------------------------
     {
@@ -6894,18 +6958,11 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    int TopLevelContext::get_depth(void) const
-    //--------------------------------------------------------------------------
-    {
-      return -1;
-    }
-
-    //--------------------------------------------------------------------------
     void TopLevelContext::pack_remote_context(Serializer &rez, 
                                               AddressSpaceID target)
     //--------------------------------------------------------------------------
     {
-      rez.serialize<bool>(true); // top level context, all we need to pack
+      rez.serialize(depth);
     }
 
     //--------------------------------------------------------------------------
@@ -7068,6 +7125,13 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    int RemoteTask::get_depth(void) const
+    //--------------------------------------------------------------------------
+    {
+      return owner->get_depth();
+    }
+
+    //--------------------------------------------------------------------------
     UniqueID RemoteTask::get_unique_id(void) const
     //--------------------------------------------------------------------------
     {
@@ -7089,30 +7153,30 @@ namespace Legion {
     }
     
     //--------------------------------------------------------------------------
-    int RemoteTask::get_depth(void) const
-    //--------------------------------------------------------------------------
-    {
-      return owner->get_depth();
-    }
-
-    //--------------------------------------------------------------------------
     const char* RemoteTask::get_task_name(void) const
     //--------------------------------------------------------------------------
     {
       TaskImpl *task_impl = owner->runtime->find_task_impl(task_id);
       return task_impl->get_name();
     }
-    
+
+    //--------------------------------------------------------------------------
+    bool RemoteTask::has_trace(void) const
+    //--------------------------------------------------------------------------
+    {
+      return false;
+    }
+
     /////////////////////////////////////////////////////////////
     // Remote Context 
     /////////////////////////////////////////////////////////////
 
     //--------------------------------------------------------------------------
     RemoteContext::RemoteContext(Runtime *rt, UniqueID context_uid)
-      : InnerContext(rt, NULL, false/*full inner*/, remote_task.regions, 
+      : InnerContext(rt, NULL, -1, false/*full inner*/, remote_task.regions, 
           local_parent_req_indexes, local_virtual_mapped, 
           context_uid, true/*remote*/),
-        parent_ctx(NULL), depth(-1), top_level_context(false), 
+        parent_ctx(NULL), top_level_context(false), 
         remote_task(RemoteTask(this))
     //--------------------------------------------------------------------------
     {
@@ -7120,7 +7184,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     RemoteContext::RemoteContext(const RemoteContext &rhs)
-      : InnerContext(NULL, NULL, false, rhs.regions, local_parent_req_indexes,
+      : InnerContext(NULL, NULL, 0, false, rhs.regions,local_parent_req_indexes,
           local_virtual_mapped, 0, true), remote_task(RemoteTask(this))
     //--------------------------------------------------------------------------
     {
@@ -7162,13 +7226,6 @@ namespace Legion {
       // should never be called
       assert(false);
       return *this;
-    }
-
-    //--------------------------------------------------------------------------
-    int RemoteContext::get_depth(void) const
-    //--------------------------------------------------------------------------
-    {
-      return depth;
     }
 
     //--------------------------------------------------------------------------
@@ -7494,11 +7551,11 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       DETAILED_PROFILER(runtime, REMOTE_UNPACK_CONTEXT_CALL);
-      derez.deserialize(top_level_context);
+      derez.deserialize(depth);
+      top_level_context = (depth < 0);
       // If we're the top-level context then we're already done
       if (top_level_context)
         return;
-      derez.deserialize(depth);
       WrapperReferenceMutator mutator(preconditions);
       remote_task.unpack_external_task(derez, runtime, &mutator);
       local_parent_req_indexes.resize(remote_task.regions.size()); 
@@ -7603,13 +7660,8 @@ namespace Legion {
       derez.deserialize(to_trigger);
 
       // Always defer this in case it blocks, we can't block the virtual channel
-      RemotePhysicalRequestArgs args;
-      args.context_uid = context_uid;
-      args.target = target;
-      args.index = index;
-      args.source = source;
-      args.to_trigger = to_trigger;
-      args.runtime = runtime;
+      RemotePhysicalRequestArgs args(context_uid, target, index, 
+                                     source, to_trigger, runtime);
       runtime->issue_runtime_meta_task(args, LG_LATENCY_DEFERRED_PRIORITY);
     }
 
@@ -7680,12 +7732,7 @@ namespace Legion {
       {
         // Launch a continuation in case we need to page in the context
         // We obviously can't block the virtual channel
-        RemotePhysicalResponseArgs args;
-        args.target = target;
-        args.index = index;
-        args.result_uid = result_uid;
-        args.handle = handle;
-        args.runtime = runtime;
+        RemotePhysicalResponseArgs args(target,index,result_uid,handle,runtime);
         RtEvent done = 
           runtime->issue_runtime_meta_task(args, LG_LATENCY_DEFERRED_PRIORITY);
         Runtime::trigger_event(to_trigger, done);
@@ -7722,14 +7769,14 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     LeafContext::LeafContext(Runtime *rt, TaskOp *owner)
-      : TaskContext(rt, owner, owner->regions)
+      : TaskContext(rt, owner, owner->get_depth(), owner->regions)
     //--------------------------------------------------------------------------
     {
     }
 
     //--------------------------------------------------------------------------
     LeafContext::LeafContext(const LeafContext &rhs)
-      : TaskContext(NULL, NULL, rhs.regions)
+      : TaskContext(NULL, NULL, 0, rhs.regions)
     //--------------------------------------------------------------------------
     {
       // should never be called
@@ -8323,12 +8370,13 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void LeafContext::remap_region(PhysicalRegion region)
+    ApEvent LeafContext::remap_region(PhysicalRegion region)
     //--------------------------------------------------------------------------
     {
       REPORT_LEGION_ERROR(ERROR_ILLEGAL_REMAP_OPERATION,
         "Illegal remap operation performed in leaf task %s "
                      "(ID %lld)", get_task_name(), get_unique_id())
+      return ApEvent::NO_AP_EVENT;
     }
 
     //--------------------------------------------------------------------------
@@ -8519,6 +8567,14 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    unsigned LeafContext::register_new_summary_operation(TraceSummaryOp *op)
+    //--------------------------------------------------------------------------
+    {
+      assert(false);
+      return 0;
+    }
+
+    //--------------------------------------------------------------------------
     void LeafContext::add_to_prepipeline_queue(Operation *op)
     //--------------------------------------------------------------------------
     {
@@ -8535,6 +8591,13 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void LeafContext::add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
         const void *result, size_t size, PhysicalInstance instance)
+    //--------------------------------------------------------------------------
+    {
+      assert(false);
+    }
+
+    //--------------------------------------------------------------------------
+    void LeafContext::register_executing_child(Operation *op)
     //--------------------------------------------------------------------------
     {
       assert(false);
@@ -8594,7 +8657,24 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void LeafContext::begin_trace(TraceID tid)
+    RtEvent LeafContext::get_current_mapping_fence_event(void)
+    //--------------------------------------------------------------------------
+    {
+      assert(false);
+      return RtEvent::NO_RT_EVENT;
+    }
+
+    //--------------------------------------------------------------------------
+    ApEvent LeafContext::get_current_execution_fence_event(void)
+    //--------------------------------------------------------------------------
+    {
+      assert(false);
+      return ApEvent::NO_AP_EVENT;
+    }
+
+
+    //--------------------------------------------------------------------------
+    void LeafContext::begin_trace(TraceID tid, bool logical_only)
     //--------------------------------------------------------------------------
     {
       REPORT_LEGION_ERROR(ERROR_ILLEGAL_LEGION_BEGIN_TRACE,
@@ -8627,6 +8707,33 @@ namespace Legion {
       REPORT_LEGION_ERROR(ERROR_ILLEGAL_LEGION_BEGIN_STATIC_TRACE,
         "Illegal Legion end static trace call in leaf task %s "
                      "(ID %lld)", get_task_name(), get_unique_id())
+    }
+
+    //--------------------------------------------------------------------------
+    void LeafContext::record_previous_trace(LegionTrace *trace)
+    //--------------------------------------------------------------------------
+    {
+#ifdef DEBUG_LEGION
+      assert(false);
+#endif
+      exit(ERROR_LEAF_TASK_VIOLATION);
+    }
+
+    //--------------------------------------------------------------------------
+    void LeafContext::invalidate_trace_cache(
+                                     LegionTrace *trace, Operation *invalidator)
+    //--------------------------------------------------------------------------
+    {
+#ifdef DEBUG_LEGION
+      assert(false);
+#endif
+      exit(ERROR_LEAF_TASK_VIOLATION);
+    }
+
+    //--------------------------------------------------------------------------
+    void LeafContext::record_blocking_call(void)
+    //--------------------------------------------------------------------------
+    {
     }
 
     //--------------------------------------------------------------------------
@@ -8967,7 +9074,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     InlineContext::InlineContext(Runtime *rt, TaskContext *enc, TaskOp *child)
-      : TaskContext(rt, child, child->regions), 
+      : TaskContext(rt, child, enc->get_depth(), child->regions), 
         enclosing(enc), inline_task(child)
     //--------------------------------------------------------------------------
     {
@@ -8998,7 +9105,8 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     InlineContext::InlineContext(const InlineContext &rhs)
-      : TaskContext(NULL, NULL, rhs.regions), enclosing(NULL), inline_task(NULL)
+      : TaskContext(NULL, NULL, 0, rhs.regions), 
+        enclosing(NULL), inline_task(NULL)
     //--------------------------------------------------------------------------
     {
       // should never be called
@@ -9039,13 +9147,6 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       return owner_task->get_unique_id();
-    }
-
-    //--------------------------------------------------------------------------
-    int InlineContext::get_depth(void) const
-    //--------------------------------------------------------------------------
-    {
-      return owner_task->get_depth();
     }
 
     //--------------------------------------------------------------------------
@@ -9518,10 +9619,10 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InlineContext::remap_region(PhysicalRegion region)
+    ApEvent InlineContext::remap_region(PhysicalRegion region)
     //--------------------------------------------------------------------------
     {
-      enclosing->remap_region(region);
+      return enclosing->remap_region(region);
     }
 
     //--------------------------------------------------------------------------
@@ -9669,6 +9770,13 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    unsigned InlineContext::register_new_summary_operation(TraceSummaryOp *op)
+    //--------------------------------------------------------------------------
+    {
+      return enclosing->register_new_summary_operation(op);
+    }
+
+    //--------------------------------------------------------------------------
     void InlineContext::add_to_prepipeline_queue(Operation *op)
     //--------------------------------------------------------------------------
     {
@@ -9688,6 +9796,13 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       enclosing->add_to_post_task_queue(ctx, wait_on, result, size, inst);
+    }
+
+    //--------------------------------------------------------------------------
+    void InlineContext::register_executing_child(Operation *op)
+    //--------------------------------------------------------------------------
+    {
+      enclosing->register_executing_child(op);
     }
 
     //--------------------------------------------------------------------------
@@ -9742,10 +9857,25 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InlineContext::begin_trace(TraceID tid)
+    RtEvent InlineContext::get_current_mapping_fence_event(void)
     //--------------------------------------------------------------------------
     {
-      enclosing->begin_trace(tid);
+      return enclosing->get_current_mapping_fence_event();
+    }
+
+    //--------------------------------------------------------------------------
+    ApEvent InlineContext::get_current_execution_fence_event(void)
+    //--------------------------------------------------------------------------
+    {
+      return enclosing->get_current_execution_fence_event();
+    }
+
+
+    //--------------------------------------------------------------------------
+    void InlineContext::begin_trace(TraceID tid, bool logical_only)
+    //--------------------------------------------------------------------------
+    {
+      enclosing->begin_trace(tid, logical_only);
     }
 
     //--------------------------------------------------------------------------
@@ -9767,6 +9897,28 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       enclosing->end_static_trace();
+    }
+
+    //--------------------------------------------------------------------------
+    void InlineContext::record_previous_trace(LegionTrace *trace)
+    //--------------------------------------------------------------------------
+    {
+      enclosing->record_previous_trace(trace);
+    }
+
+    //--------------------------------------------------------------------------
+    void InlineContext::invalidate_trace_cache(
+                                     LegionTrace *trace, Operation *invalidator)
+    //--------------------------------------------------------------------------
+    {
+      enclosing->invalidate_trace_cache(trace, invalidator);
+    }
+
+    //--------------------------------------------------------------------------
+    void InlineContext::record_blocking_call(void)
+    //--------------------------------------------------------------------------
+    {
+      enclosing->record_blocking_call();
     }
 
     //--------------------------------------------------------------------------

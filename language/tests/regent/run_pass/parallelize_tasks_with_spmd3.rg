@@ -14,7 +14,7 @@
 
 -- runs-with:
 -- [
---  ["-ll:cpu", "3", "-fbounds-checks", "1", "-fdebug", "1",
+--  ["-ll:cpu", "3", "-fbounds-checks", "1",
 --   "-fparallelize-dop", "9", "-fflow-spmd", "1", "-fflow-spmd-shardsize", "3"],
 --  ["-ll:cpu", "4", "-fflow-spmd", "1"],
 --  ["-ll:cpu", "4", "-fflow-spmd", "1", "-fflow-spmd-shardsize", "2"]
@@ -59,6 +59,10 @@ end
 task test(size : int)
   var is = ispace(int3d, {size, size, size})
   var primary_region = region(is, fs)
+
+  fill(primary_region.f, 1)
+  fill(primary_region.g, 2)
+  fill(primary_region.h, 3)
 
   var steps = 1
   __demand(__spmd)
