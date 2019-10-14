@@ -93,13 +93,6 @@ typedef
     size_t /*userlen*/,
     realm_id_t /*proc_id*/);
 
-// APERRY
-typedef struct context context;
-context* getRealmCTX();
-void realmInitRuntime(int argc, char** argv);
-//NOTE: realmSpawn declared and defined in wrapper.cc
-void realmSync();
-// end APERRY
 #ifdef __cplusplus
 }
 #endif
